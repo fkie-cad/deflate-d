@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deflate-d"
+version = "0.1.0"
+description = "Token-efficient reformatting of decompiler output for LLM consumption"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Fraunhofer FKIE" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+deflate-d = "deflated.reformat:main"
+
+[tool.setuptools]
+packages = ["deflated", "deflated.transforms", "deflated.examples"]
+
+[tool.setuptools.package-data]
+"deflated.examples" = ["*.c"]
