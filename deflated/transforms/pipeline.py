@@ -65,9 +65,14 @@ class Pipeline:
         return [t.id for t in self.transforms]
 
 
-# Canonical application order. Structural/contextual/reductive rewrites run
-# first; cosmetic normalization runs last so it tidies up after the other edits.
-# `build_pipeline` filters this list by tier, preserving relative order.
+# Canonical application order. A transform's position here and its tier are
+# independent: the tier (the `# Tn` tag on each line) only decides *whether* it
+# runs at a given target, while the position decides *when*, by what each pass
+# needs from the ones before it. So the list is deliberately not sorted by tier:
+# cosmetic normalization (T1) runs last so it tidies up after the other edits and
+# so earlier passes still see one statement per line, and `decl-coalesce` (T2)
+# sits among the T3 passes. `build_pipeline` filters this list by tier,
+# preserving relative order.
 #
 # The registry holds transform *classes*, not instances: `build_pipeline`
 # constructs a fresh object per call so two pipelines never share one. Module-level
@@ -90,7 +95,7 @@ ORDERED_TRANSFORMS: list[type[Transform]] = [
     RedundantCastElision,  # T2
     DropSingleStatementBraces,  # T2
     CompoundAssignment,  # T2
-    CanonicalizeControlFlow,  # T2 (label/jump cleanup; runs last)
+    CanonicalizeControlFlow,  # T2 (label/jump cleanup)
     MinimizeIntegerLiterals,  # T2 (hex int literals -> shorter decimal; lossless)
     DerefOffsetToIndex,  # T2 (*(p+N) -> p[N]; lossless)
     DropTrailingReturn,  # T2 (drops redundant trailing `return;`)

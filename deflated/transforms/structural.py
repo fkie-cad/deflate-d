@@ -13,15 +13,15 @@ from __future__ import annotations
 import re
 
 from .base import Tier, Transform
-from .lexer import SegmentType, scan, strip_comments
-from .tokens import (
-    Token,
+from .ctokens import (
+    CToken,
+    ctokenize as _tok_offsets,
     has_top as _has_top,
     match_delim as _match_delim,
     split_statements as _split_statements,
-    tokenize as _tok_offsets,
     word_before as _word_before,
 )
+from .lexer import SegmentType, scan, strip_comments
 
 # Keywords whose first word introduces a control statement (so a block body
 # beginning with one is *not* a single simple statement) ...
@@ -621,7 +621,7 @@ class CompoundAssignment(Transform):
         return f"{lead}{label}{lhs_text} {op}= {remainder};{trail}"
 
     @staticmethod
-    def _remainder_safe(op: str, rem: list[Token]) -> bool:
+    def _remainder_safe(op: str, rem: list[CToken]) -> bool:
         """True if ``a OP= rem`` preserves the meaning of ``a = a OP rem``.
 
         Folding re-groups the right-hand side as ``a OP (rem)``. That is only
@@ -651,7 +651,7 @@ class CompoundAssignment(Transform):
         return True
 
     @staticmethod
-    def _assign_index(toks: list[Token]) -> int:
+    def _assign_index(toks: list[CToken]) -> int:
         """Index of the first top-level plain ``=`` token, or -1."""
         depth = 0
         for idx, (t, _, _) in enumerate(toks):
@@ -705,7 +705,7 @@ class RedundantCastElision(Transform):
             code = code[:lo] + code[hi:]
         return code
 
-    def _first_dup_cast(self, toks: list[Token]):
+    def _first_dup_cast(self, toks: list[CToken]):
         n = len(toks)
         for i in range(n):
             if toks[i][0] != "(":

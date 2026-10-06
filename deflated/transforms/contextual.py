@@ -19,8 +19,8 @@ import string
 from collections import Counter
 
 from .base import Tier, Transform
+from .ctokens import ctokenize as _tok_offsets, match_delim as _match_delim, split_args as _split_args
 from .lexer import SegmentType, scan
-from .tokens import match_delim as _match_delim, split_args as _split_args, tokenize as _tok_offsets
 
 # Keywords/types we must never hand out as a generated short name.
 _RESERVED = {

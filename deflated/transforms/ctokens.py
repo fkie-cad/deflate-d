@@ -1,4 +1,4 @@
-"""Token-stream toolkit: the layer between the lexer and the transforms.
+"""C token-stream toolkit: the layer between the lexer and the transforms.
 
 ``lexer.scan`` segments source into code / string / char / comment regions. The
 structural transforms need a finer view --- a stream of C tokens with their
@@ -25,22 +25,22 @@ import re
 
 from .lexer import SegmentType, scan
 
-Token = tuple[str, int, int]  # (text, start, end) into the original string
+CToken = tuple[str, int, int]  # (text, start, end) into the original string
 
 # A single C token: multi-char operators first (so they are not split), then
 # identifiers, hex/decimal numbers, and finally any single non-space character.
-TOKEN = re.compile(
+CTOKEN = re.compile(
     r"<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=" r"|[A-Za-z_]\w*" r"|0[xX][0-9a-fA-F]+" r"|\d+\.?\d*" r"|\S"
 )
 
 
-def tokenize(s: str) -> list[Token]:
+def ctokenize(s: str) -> list[CToken]:
     """Tokenize ``s`` into ``(text, start, end)`` triples (string/comment-safe).
 
     String, character, and comment regions are emitted as one opaque token each,
     so their contents never participate in token matching.
     """
-    out: list[Token] = []
+    out: list[CToken] = []
     pos = 0
     for seg_type, text in scan(s):
         if seg_type != SegmentType.CODE:
@@ -48,7 +48,7 @@ def tokenize(s: str) -> list[Token]:
                 out.append((text, pos, pos + len(text)))
             pos += len(text)
             continue
-        for m in TOKEN.finditer(text):
+        for m in CTOKEN.finditer(text):
             out.append((m.group(0), pos + m.start(), pos + m.end()))
         pos += len(text)
     return out
@@ -82,7 +82,7 @@ def split_statements(code: str) -> list[str]:
     return pieces
 
 
-def match_delim(toks: list[Token], i: int, op: str, cl: str) -> int | None:
+def match_delim(toks: list[CToken], i: int, op: str, cl: str) -> int | None:
     """Index of the delimiter matching ``toks[i] == op``, or None."""
     depth = 0
     for j in range(i, len(toks)):
@@ -96,7 +96,7 @@ def match_delim(toks: list[Token], i: int, op: str, cl: str) -> int | None:
     return None
 
 
-def split_args(toks: list[Token], open_idx: int, close_idx: int) -> list[tuple[int, int]]:
+def split_args(toks: list[CToken], open_idx: int, close_idx: int) -> list[tuple[int, int]]:
     """Token-index spans of the top-level, comma-separated arguments of a call.
 
     ``open_idx``/``close_idx`` are the indices of a matched ``(`` / ``)``. Returns
@@ -120,7 +120,7 @@ def split_args(toks: list[Token], open_idx: int, close_idx: int) -> list[tuple[i
     return args
 
 
-def has_top(toks: list[Token], lo: int, hi: int, chars: frozenset) -> bool:
+def has_top(toks: list[CToken], lo: int, hi: int, chars: frozenset) -> bool:
     """True if any token in ``toks[lo:hi]`` is in ``chars`` at delimiter depth 0."""
     depth = 0
     for j in range(lo, hi):
