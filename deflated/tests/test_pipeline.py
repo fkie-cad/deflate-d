@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated import Tier, transform
 from deflated.transforms import build_pipeline
 from deflated.transforms.base import parse_tier
@@ -19,6 +21,36 @@ def test_pipeline_membership() -> None:
 
 def test_exclude_drops_transform() -> None:
     assert "compress-names" not in build_pipeline(3, exclude={"compress-names"}).ids()
+
+
+def test_build_pipeline_rejects_unknown_exclude_id() -> None:
+    with pytest.raises(ValueError):
+        build_pipeline("T3", exclude={"no-such-id"})
+
+
+def test_pipelines_do_not_share_transform_instances() -> None:
+    # The registry holds transform *classes*, so every build_pipeline() call gets
+    # fresh instances. Sharing them would let one pipeline clobber another's
+    # CompressPlaceholderNames.current_mapping, which is exactly what that
+    # attribute is read for.
+    a, b = build_pipeline("T3"), build_pipeline("T3")
+    assert all(x is not y for x, y in zip(a.transforms, b.transforms))
+
+
+def test_placeholder_mapping_is_recoverable_from_a_pipeline() -> None:
+    # The documented way to get the rename map back out of a pipeline run, and the
+    # reason current_mapping exists: compress-names rewrites text that earlier
+    # passes already changed, so a caller cannot re-derive the map from `src`.
+    p = build_pipeline("T3")
+    out = p.apply("void FUN_1(int param_1){ int local_10; local_10 = param_1; }")
+    mapping = next(t for t in p.transforms if t.id == "compress-names").current_mapping
+    assert set(mapping) == {"param_1", "local_10"}
+    for old, new in mapping.items():
+        assert old not in out and new in out
+
+    # A second pipeline must not disturb the first one's record.
+    build_pipeline("T3").apply("void FUN_9(int param_9){ int local_99; local_99 = param_9; }")
+    assert set(mapping) == {"param_1", "local_10"}
 
 
 def test_monotonic_size(ghidra_sample: str) -> None:

@@ -24,9 +24,11 @@ from pathlib import Path
 import pytest
 
 from deflated.reformat import main
+from deflated.transforms import build_pipeline
 from deflated.transforms.lexer import SegmentType, scan
 
 SAMPLES = Path(__file__).parent / "samples"
+EXAMPLES = Path(__file__).parent.parent / "examples"
 
 ALL_SAMPLES = [
     "newline_in_string.c",
@@ -35,6 +37,13 @@ ALL_SAMPLES = [
     "comment_like_string.c",
     "string_concat.c",
     "quoted_name_and_char.c",
+]
+
+ALL_EXAMPLES = [
+    "ghidra_sample.c",
+    "vtables_ghidra.c",
+    "vtables_hexrays.c",
+    "vtables_binja.c",
 ]
 
 
@@ -171,3 +180,22 @@ def test_tiers_monotonically_shrink_on_a_real_function(capsys) -> None:
     # Each higher tier is at least as aggressive: output size never grows.
     sizes = [len(run(capsys, "newline_in_string.c", t)) for t in ("T1", "T2", "T3", "T4")]
     assert all(a >= b for a, b in zip(sizes, sizes[1:]))
+
+
+# --- idempotence: a pipeline is a fixed point of itself ---
+
+
+@pytest.mark.parametrize("tier", ["T1", "T2", "T3", "T4"])
+@pytest.mark.parametrize(
+    "path",
+    [EXAMPLES / n for n in ALL_EXAMPLES] + [SAMPLES / n for n in ALL_SAMPLES],
+    ids=ALL_EXAMPLES + ALL_SAMPLES,
+)
+def test_pipeline_is_idempotent(path: Path, tier: str) -> None:
+    # Running a tier over its own output must change nothing: every pass has to
+    # reach its fixed point in one run. A second pass that still finds work means
+    # a pass gave up early (an iteration cap) or two passes feed each other.
+    src = path.read_text(encoding="utf-8")
+    pipe = build_pipeline(tier)
+    once = pipe.apply(src)
+    assert pipe.apply(once) == once

@@ -1,14 +1,15 @@
-"""DEFLATE-D: token-efficient reformatting of decompiler output.
+"""
+DEFLATE-D: token-efficient reformatting of decompiler output.
 
-Quick start::
+Public API:
 
-    from deflated import transform, Tier
+- ``transform``: apply the pipeline for a tier to a string in one call.
+- ``build_pipeline``: build a reusable ``Pipeline`` for a tier.
+- ``Pipeline``: an ordered sequence of transforms.
+- ``Tier``: the reduction tiers and what each one discards.
+- ``parse_tier``: convert ``"T3"``, ``3`` or ``Tier`` to a ``Tier``.
 
-    compressed = transform(raw_decompiler_output, Tier.T2_STRUCTURAL)
-
-Tiers are cumulative and ordered by information loss: T1 (cosmetic, lossless),
-T2 (structural, lossless), T3 (contextual --- discards machine-generated names /
-type verbosity), T4 (reductive --- discards low-confidence analyst signal).
+The command-line interface is ``python -m deflated.reformat``; see the README for examples.
 """
 
 from __future__ import annotations

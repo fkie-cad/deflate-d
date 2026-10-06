@@ -160,11 +160,35 @@ class TestCompressPlaceholderNames:
         out = c.apply('x = local_10; s = "local_10";')
         assert '"local_10"' in out
 
-    def test_last_mapping_populated(self) -> None:
+    def test_apply_with_mapping_reports_each_rename(self) -> None:
+        # The map is the caller's only way back to the original identities, so it
+        # must name every placeholder that was rewritten and never collapse two of
+        # them onto one short name.
         c = CompressPlaceholderNames()
+        out, mapping = c.apply_with_mapping("x = local_10 + local_20;")
+        assert "local_10" in mapping and "local_20" in mapping
+        assert mapping["local_10"] != mapping["local_20"]
+        for old, new in mapping.items():
+            assert old not in out and new in out
+
+    def test_current_mapping_tracks_the_latest_apply(self) -> None:
+        # The attribute exists for callers that only hold a pipeline and cannot use
+        # apply_with_mapping. It must describe the output just returned -- not the
+        # one before it -- so a stale read is impossible.
+        c = CompressPlaceholderNames()
+        assert c.current_mapping == {}
+        c.apply("x = local_99;")
+        assert set(c.current_mapping) == {"local_99"}
         c.apply("x = local_10 + local_20;")
-        assert "local_10" in c.last_mapping and "local_20" in c.last_mapping
-        assert c.last_mapping["local_10"] != c.last_mapping["local_20"]
+        assert set(c.current_mapping) == {"local_10", "local_20"}
+
+    def test_apply_carries_no_state_between_calls(self) -> None:
+        # current_mapping is written but never read back, so it must not influence
+        # the rewrite: reusing one instance has to give the same answer as a fresh
+        # one. That is the "pure function" contract in base.Transform.
+        c = CompressPlaceholderNames()
+        c.apply("x = local_99;")
+        assert c.apply("x = local_10;") == CompressPlaceholderNames().apply("x = local_10;")
 
     def test_bn_label_renamed(self) -> None:
         c = CompressPlaceholderNames()

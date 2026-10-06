@@ -9,18 +9,21 @@ from enum import IntEnum
 class Tier(IntEnum):
     """Cumulative aggressiveness tiers, ordered by information loss.
 
-    Each step up adds transforms with a single honest answer to "what might I
-    lose?": T1 loses only formatting you did not write; T2 loses nothing
-    meaningful; T3 discards machine-generated identifiers and type verbosity
-    (decompiler bookkeeping); T4 discards low-confidence analyst signal (ABI
-    keywords, decompiler warning banners) that is not recoverable from the text.
+    Each tier includes all transforms of the tiers below it.
     """
 
-    T0_RAW = 0  # no transformation
-    T1_COSMETIC = 1  # lossless: formatting invisible to semantics
-    T2_STRUCTURAL = 2  # lossless: information-preserving rewrites
-    T3_CONTEXTUAL = 3  # lossy: discards machine-generated names / type verbosity
-    T4_REDUCTIVE = 4  # lossy: discards low-confidence analyst signal
+    #: No transformation.
+    T0_RAW = 0
+    #: Lossless: formatting invisible to semantics.
+    T1_COSMETIC = 1
+    #: Semantics-preserving rewrites; drops all comments (including address metadata).
+    T2_STRUCTURAL = 2
+    #: Lossy: discards decompiler bookkeeping (machine-generated names, type verbosity,
+    #: reading hints).
+    T3_CONTEXTUAL = 3
+    #: Lossy: discards low-confidence analyst signal (ABI keywords, warning banners,
+    #: width casts) and boilerplate bodies (thunks, resolver stubs, CRT functions).
+    T4_REDUCTIVE = 4
 
 
 _TIER_ALIASES = {
@@ -58,8 +61,11 @@ def parse_tier(value: str | int | Tier) -> Tier:
 class Transform(ABC):
     """A single source-to-source rewrite.
 
-    Subclasses set :attr:`id` and :attr:`tier` and implement :meth:`apply`.
-    A transform must be a pure function of its input string.
+    Subclasses set attributes `id`, `tier` and `description` and implement method `apply`.
+    To take effect, the *class* must be added to ``ORDERED_TRANSFORMS`` in `deflated.transforms.pipeline.py`;
+    `build_pipeline` instantiates it once per pipeline, so the class must be constructible with no arguments and
+    `apply` must be a pure function of its argument. It may record something for the caller to read afterward
+    (`CompressPlaceholderNames.current_mapping`), as long as it never reads that record back.
     """
 
     #: Stable short identifier, used on the CLI (``--exclude``) and in reports.

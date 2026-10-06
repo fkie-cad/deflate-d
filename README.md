@@ -1,33 +1,27 @@
 # DEFLATE-D
 
-This repository contains the prototype implementation of DEFLATE-D, the
-deterministic decompiler-output reformatter introduced in our SURE '26 paper
-*"Stop Paying for Whitespace: Token-Efficient Decompiler Output for LLM-Assisted
-Binary Analysis"* (see [How to
-reference](#how-to-reference-this-approach-or-prototype-implementation)).
+This repository contains the prototype implementation of DEFLATE-D, the deterministic decompiler-output reformatter 
+introduced in our SURE '26 paper *"Stop Paying for Whitespace: Token-Efficient Decompiler Output for LLM-Assisted
+Binary Analysis"* (see [How to reference](#how-to-reference-this-approach-or-prototype-implementation)).
 
-Token-efficient reformatting of decompiler output. DEFLATE-D rewrites C
-pseudocode from **Ghidra, IDA/Hex-Rays, and Binary Ninja** into a much
-cheaper-to-tokenize form before you feed it to an LLM.
+Token-efficient reformatting of decompiler output. DEFLATE-D rewrites C pseudocode from **Ghidra, IDA/Hex-Rays, and 
+Binary Ninja** into a much cheaper-to-tokenize form before you feed it to an LLM.
 
 ## Tiers
 
-Transforms are grouped into cumulative **tiers**, ordered by how much
-information each step can lose:
+Transforms are grouped into cumulative **tiers**, ordered by how much information each step can lose:
 
-| Tier | Name | What you lose |
-|------|------|---------------|
-| **T1** | Cosmetic | nothing but formatting/whitespace |
+| Tier   | Name       | What you lose                                                                                                         |
+|--------|------------|-----------------------------------------------------------------------------------------------------------------------|
+| **T1** | Cosmetic   | nothing but formatting/whitespace                                                                                     |
 | **T2** | Structural | semantics-preserving rewrites (casts, braces, …); only the comment pass drops auto-generated address/storage metadata |
-| **T3** | Contextual | machine-generated identifiers and type verbosity (decompiler bookkeeping) |
-| **T4** | Reductive | low-confidence analyst signal (ABI keywords, decompiler `WARNING` banners, …) |
+| **T3** | Contextual | machine-generated identifiers, type verbosity, and redundant spellings that only carry a reading hint                 |
+| **T4** | Reductive  | low-confidence analyst signal (ABI keywords, decompiler `WARNING` banners, …)                                         |
 
-Tiers are cumulative (T4 ⊇ T3 ⊇ T2 ⊇ T1). **T3 is the recommended default**; T4 is
-opt-in for the most aggressive cost reduction. Typical savings on the bundled
-`examples/ghidra_sample.c` (GPT tokenizer): T1 ≈ 20%, T2 ≈ 30%, T3 ≈ 54%,
-T4 ≈ 60%. On the larger `examples/vtables_*.c` samples, T3/T4 save ≈ 55%/57%
-(Ghidra), ≈ 55%/60% (Hex-Rays), and ≈ 43%/47% (Binary Ninja); absolute
-magnitudes shift across tokenizers but the tier ranking is stable.
+Tiers are cumulative (T4 ⊇ T3 ⊇ T2 ⊇ T1). **T3 is the recommended default**; T4 is opt-in for the most aggressive cost 
+reduction. Typical savings on the bundled `examples/ghidra_sample.c` (GPT tokenizer): T1 ≈ 20%, T2 ≈ 30%, T3 ≈ 54%,
+T4 ≈ 60%. On the larger `examples/vtables_*.c` samples, T3/T4 save ≈ 55%/57% (Ghidra), ≈ 55%/60% (Hex-Rays), and 
+≈ 43%/47% (Binary Ninja); absolute magnitudes shift across tokenizers but the tier ranking is stable.
 
 ## Install
 
@@ -74,14 +68,12 @@ pip install -e ".[test]"
 pytest deflated/tests/
 ```
 
-See [`deflated/README.md`](deflated/README.md) for the full per-transform
-reference and scope notes.
+See [`deflated/README.md`](deflated/README.md) for the full per-transform reference and scope notes.
 
 ## How to reference this approach or prototype implementation
 
-DEFLATE-D is described in the following paper, to appear at the 2nd Workshop on
-Software Understanding and Reverse Engineering (SURE '26), co-located with ACM
-CCS 2026. If you use it in academic work, please cite:
+DEFLATE-D is described in the following paper, to appear at the 2nd Workshop on Software Understanding and Reverse 
+Engineering (SURE '26), co-located with ACM CCS 2026. If you use it in academic work, please cite:
 
 ```bibtex
 @inproceedings{enders2026deflated,
@@ -96,9 +88,8 @@ CCS 2026. If you use it in academic work, please cite:
 
 ## Development
 
-This project was developed with the assistance of Anthropic's Claude, under the
-authors' direction and review. All design decisions and correctness criteria are
-the authors' own, and every transform is covered by the test suite.
+This project was developed with the assistance of Anthropic's Claude, under the authors' direction and review. All 
+design decisions and correctness criteria are the authors' own, and every transform is covered by the test suite.
 
 ## License
 

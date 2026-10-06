@@ -381,13 +381,45 @@ class CompressPlaceholderNames(Transform):
     def __init__(self, patterns: tuple[str, ...] | None = None) -> None:
         pats = patterns or self.DEFAULT_PATTERNS
         self._is_placeholder = re.compile(r"^(?:" + "|".join(pats) + r")$")
-        #: Populated by :meth:`apply` with {placeholder: short_name}; lets a
-        #: downstream caller (e.g. a variable-name recovery evaluation) map
-        #: predictions on the compressed code back to the original placeholder
-        #: identities.
-        self.last_mapping: dict[str, str] = {}
+        #: The {placeholder: short_name} map for the code :meth:`apply` returned most
+        #: recently --- ``{}`` before the first call. Read it straight after the
+        #: ``apply`` whose output you hold; the next ``apply`` on this instance
+        #: replaces it.
+        #:
+        #: This is the only way to recover the mapping from a pipeline run, because
+        #: ``compress-names`` rewrites text that earlier passes already changed, so its
+        #: input cannot be reconstructed from the original source::
+        #:
+        #:     p = build_pipeline("T3")
+        #:     out = p.apply(src)
+        #:     m = next(t for t in p.transforms if t.id == "compress-names").current_mapping
+        #:
+        #: Safe because ``build_pipeline`` gives every pipeline its own instances; with
+        #: the module-level instances this class used to be registered with, two
+        #: pipelines would overwrite each other's value here.
+        self.current_mapping: dict[str, str] = {}
 
     def apply(self, code: str) -> str:
+        # Records the mapping for callers that only have the pipeline, then returns
+        # just the text. The attribute is write-only from the transform's side: it is
+        # never read back, so the rewrite stays a pure function of `code`.
+        rewritten, mapping = self.apply_with_mapping(code)
+        self.current_mapping = mapping
+        return rewritten
+
+    def apply_with_mapping(self, code: str) -> tuple[str, dict[str, str]]:
+        """Rewrite ``code`` and return it together with the {placeholder: short_name} map.
+
+        The rename is one-way in the text: once ``local_10`` has become ``b``, nothing
+        in the output says which variable ``b`` was. A caller that needs to attribute
+        something back to the original identity --- a variable-name recovery evaluation
+        scoring a model's predictions against ground truth keyed by the decompiler's
+        placeholder --- needs this map as the join key.
+
+        Prefer this over :attr:`current_mapping` wherever you call the transform
+        directly: it hands the map back with the text it describes, so there is no
+        window in which the two can drift apart.
+        """
         segments = scan(code)
         struct_spans = _struct_body_spans(code)
 
@@ -419,12 +451,10 @@ class CompressPlaceholderNames(Transform):
         # First-seen order, de-duplicated.
         unique = list(dict.fromkeys(placeholders))
         if not unique:
-            self.last_mapping = {}
-            return code
+            return code, {}
 
         gen = _short_names(used=set(existing))
         mapping = {name: next(gen) for name in unique}
-        self.last_mapping = dict(mapping)
 
         big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
 
@@ -443,7 +473,7 @@ class CompressPlaceholderNames(Transform):
             else:
                 out.append(text)
             offset += len(text)
-        return "".join(out)
+        return "".join(out), dict(mapping)
 
 
 class SimplifyLowConfidenceTypes(Transform):
@@ -704,7 +734,12 @@ class AddressOfIndexToOffset(Transform):
     ``.`` applies to the element, not to the address --- and rewriting the
     ``&buf[0x10]`` part alone would drop the ``&`` and change the meaning
     (``(buf+0x10).field``). Declining there is the lossless direction.
-    Information-preserving, hence T3.
+
+    Semantically identical, but lossy for the reader (hence T3): the subscript
+    spelling marks ``a`` as an array and the literal as an element index, while
+    the pointer-add form drops that hint and reads easily as a byte offset. It
+    is the inverse of the T2 ``deref-offset`` rewrite, which *adds* the index
+    reading; the asymmetry is intentional.
     """
 
     id = "addr-of-index"

@@ -203,9 +203,16 @@ class StripWidthCasts(Transform):
     ``(_OWORD)``) --- spellings that do not exist in hand-written C, so they are
     pure artifacts of mapping fixed-width x86 operations back to source. We drop
     the cast (``(_BYTE)gv`` -> ``gv``) where it sits in value position, keeping
-    the operand and the surrounding operation. Lossy: the width/sign hint is
-    discarded (though it stays recoverable from the operand's declared type),
-    hence T4 alongside the other genuine-signal reductions.
+    the operand and the surrounding operation.
+
+    This is not value-preserving, and it is not merely the loss of a hint: the
+    cast performs a real truncation. ``(_BYTE)eax == 0`` asks whether the low
+    byte is zero, ``eax == 0`` asks about all 32 bits, and the two disagree for
+    every ``eax`` whose high bits are set. We accept that because the width is
+    usually an artifact of instruction selection rather than of the original
+    source, and because the operand's declared type still lets a reader recover
+    the intended reading --- a trade of fidelity for brevity that belongs in T4
+    alongside the other genuine-signal reductions, and never in a lossless tier.
 
     Only the exact shape ``( <pseudo-width-type> )`` followed by an operand start
     is removed. A pointer cast (``(_BYTE *)p`` --- a real reinterpretation whose
@@ -213,11 +220,13 @@ class StripWidthCasts(Transform):
     ``sizeof(_QWORD)`` or a call ``f(_QWORD)`` is excluded by the value-position
     guard, so no operator-bearing or size-of context is ever touched. A cast on
     a *literal* that the width would narrow is also left in place: stripping
-    ``(_DWORD)0x123456789`` would drop the truncation and change the value (and a
-    float operand always truncates). Decompiler output never puts a width cast on
-    a literal --- the operand is always a recovered variable/expression --- so
-    this literal guard is defensive; it declines only the value-unsafe cases and
-    leaves every other site to the existing (lossy) rule.
+    ``(_DWORD)0x123456789`` would turn one constant into a different constant
+    (and a float operand always truncates). That guard is not what makes the
+    pass safe --- per above, it isn't safe --- it only excludes the one shape
+    where nothing left on the page could tell a reader what the value was meant
+    to be, unlike a variable whose declaration still carries the width.
+    Decompiler output never puts a width cast on a literal anyway (the operand
+    is always a recovered variable/expression), so the guard is defensive.
 
     The pseudo-width spellings are the conservative, no-false-positive subset.
     The conventional casts Hex-Rays also inserts (``(int)``, ``(char)``,
@@ -263,8 +272,8 @@ class StripWidthCasts(Transform):
 
     @classmethod
     def _literal_safe(cls, cast_type: str, toks, j: int, n: int, code: str) -> bool:
-        """Whether dropping ``(<cast_type>)`` is value-preserving for the operand
-        beginning at token index ``j`` (or ``j >= n`` when the cast ends the input).
+        """Whether dropping ``(<cast_type>)`` is permitted for the operand beginning
+        at token index ``j`` (or ``j >= n`` when the cast ends the input).
 
         A *narrowing* width cast on a literal can change the value: an integer
         literal wider than the cast truncates, and a float (or a hex-float head
@@ -272,15 +281,20 @@ class StripWidthCasts(Transform):
         unary ``+``/``-``/``~`` and unwrap a parenthesised lone literal, so
         ``(_BYTE)-1`` (== 255, not -1), ``(_BYTE)~0`` (== 255), and
         ``(_BYTE)(0x1ff)`` (== 255) are all recognised as narrowing and declined.
-        Variables and multi-token sub-expressions are unaffected --- the discarded
-        width is a decompiler hint, lossy but value-neutral --- so only literal
-        operands are scrutinised.
+
+        Variables and multi-token sub-expressions are not scrutinised, which is a
+        policy and not a safety proof: ``(_BYTE)eax`` -> ``eax`` can change the
+        value exactly as a narrowed literal does. The difference is recoverability
+        --- the variable's declaration still states the width, while a rewritten
+        constant leaves no trace of the original --- so the class accepts the
+        former as its T4 trade and this guard declines the latter.
         """
         if j >= n:
             return True
         tok, _, end = toks[j]
         # Unwrap a parenthesised lone literal: ``(LIT)`` narrows exactly as ``LIT``
-        # would; a multi-token expression in parens is value-neutral, so allow it.
+        # would; a multi-token expression in parens falls under the same trade as
+        # a bare variable, so allow it.
         if tok == "(":
             close = _match_delim(toks, j, "(", ")")
             if close == j + 2:
@@ -289,7 +303,7 @@ class StripWidthCasts(Transform):
         # A leading unary sign/complement. ``+LIT`` keeps the value; ``-LIT``/``~LIT``
         # of an integer literal become a large positive under the unsigned width
         # truncation, so the value always changes -> decline. On a variable the
-        # whole operand is an expression, so it is value-neutral.
+        # whole operand is an expression, which this guard does not police.
         if tok in ("+", "-", "~"):
             if j + 1 < n and _WCAST_INT.fullmatch(toks[j + 1][0]):
                 return cls._literal_safe(cast_type, toks, j + 1, n, code) if tok == "+" else False
@@ -1084,7 +1098,7 @@ class DerefOffsetToIndex(Transform):
     """Rewrite a dereferenced pointer-add ``*(p + N)`` to the index form ``p[N]``.
 
     ``*(p + n)`` and ``p[n]`` are identical in C for any pointer ``p`` and integer
-    ``n``, so Binary Ninja's pointer-arithmetic spelling of an array/field read
+    ``n``, so a decompiler's explicit-add spelling of an array/field read
     (``*(ji + 8)``, ``*(&mw + 0xc)``) is rewritten to the shorter, equivalent
     subscript form. Authored C writes ``p[n]`` directly; the explicit-add spelling
     is a decompiler lowering, so this is a lossless (T2) rewrite.
@@ -1098,6 +1112,27 @@ class DerefOffsetToIndex(Transform):
     re-associate against the new subscript. The base must be a single identifier
     (optionally address-of ``&x``, which is parenthesised as ``(&x)[N]`` to keep
     its precedence) and the offset a single integer literal.
+
+    What the offset *means*, though, is the decompiler's business and not C's, and
+    the three back ends disagree. Ghidra always casts the sum
+    (``*(uint *)(param_1 + 0x18)``), an inner shape this pass declines, so it never
+    fires on Ghidra output at all. Hex-Rays types the base, so ``*(this + 6)`` on a
+    ``_DWORD *this`` is genuine typed pointer arithmetic and ``this[6]`` says
+    exactly the same thing. Binary Ninja is the awkward one: it reserves the
+    subscript form for a scaled element index and falls back to the explicit add
+    precisely when the displacement is a raw *byte* offset the subscript could not
+    express. The bundled examples catch one function both ways --- the
+    ``std::string`` capacity probe at ``0x402FA0`` is ``*(this + 6)`` to Hex-Rays
+    and ``*(arg1 + 0x18)`` on a ``void* arg1`` to Binary Ninja: the same field at
+    byte 0x18, counted in elements by one tool and in bytes by the other.
+
+    The rewrite stays lossless either way --- ``*(p + n)`` and ``p[n]`` are the
+    same expression in C for every ``p``, including the ``void*`` case --- but on
+    Binary Ninja input it re-spells a byte displacement in the very notation Binary
+    Ninja reserves for element counts. ``arg1[0x18]`` therefore invites a reader
+    (or a model) reconstructing a struct layout to scale the offset a second time.
+    Nothing about the program changes; only the connotation does, and only for the
+    byte-offset dialect.
     """
 
     id = "deref-offset"

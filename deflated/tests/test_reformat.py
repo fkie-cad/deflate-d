@@ -143,3 +143,20 @@ def test_main_tiers_monotonically_shrink(tmp_path, capsys) -> None:
         main(["--tier", tier, str(f)])
         sizes.append(len(capsys.readouterr().out))
     assert all(a >= b for a, b in zip(sizes, sizes[1:]))
+
+
+def test_cli_rejects_unknown_exclude_id(tmp_path) -> None:
+    # Uses a real file: reading stdin under pytest raises OSError, which also exits 2.
+    f = tmp_path / "in.c"
+    f.write_text("int x;\n")
+    with pytest.raises(SystemExit) as e:
+        main(["--exclude", "no-such-id", str(f)])
+    assert e.value.code == 2
+
+
+@pytest.mark.parametrize("tier", ["T1", "T2", "T3", "T4"])
+def test_non_utf8_bytes_survive(tmp_path, capsysbinary, tier: str) -> None:
+    f = tmp_path / "in.c"
+    f.write_bytes(b'int f(void) { char *s = "\xe4"; return 0; }\n')
+    assert main(["--tier", tier, str(f)]) == 0
+    assert b'"\xe4"' in capsysbinary.readouterr().out

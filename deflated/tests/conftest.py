@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from importlib.resources import files
 
 import pytest
 
-import deflated
 
-
-@pytest.fixture
+@pytest.fixture(scope="session")
 def ghidra_sample() -> str:
-    """Raw text of the bundled Ghidra sample, located via the package root so
-    callers don't hard-code a `parents[N]` depth that breaks under subfolders."""
-    root = Path(deflated.__file__).resolve().parent
-    return (root / "examples" / "ghidra_sample.c").read_text()
+    """Raw text of the bundled Ghidra sample."""
+    sample = files("deflated") / "examples" / "ghidra_sample.c"
+    return sample.read_text(encoding="utf-8")
