@@ -353,3 +353,9 @@ class TestCompressPlaceholderNames:
         # ...and a real (non-placeholder) enum constant is left untouched.
         out2 = c.apply("enum Color { RED = 1, GREEN = 2 }; int f(){ return RED + GREEN; }")
         assert out2 == "enum Color { RED = 1, GREEN = 2 }; int f(){ return RED + GREEN; }"
+
+    def test_multichar_constant_contents_not_renamed(self) -> None:
+        # A placeholder spelled inside a multi-char constant is part of the
+        # constant's value, not a reference; only the real `v1` is renamed.
+        out = CompressPlaceholderNames().apply("if (v1 == 'v1  ') return;")
+        assert out == "if (a == 'v1  ') return;"

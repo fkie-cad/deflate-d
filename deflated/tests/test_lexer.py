@@ -69,6 +69,20 @@ def test_msvc_quoted_name() -> None:
     assert "vftable" in out
 
 
+def test_multichar_constant_is_a_char_segment() -> None:
+    # Multi-char constants ('ABCD', an int magic value) are common in decompiler
+    # output; they must be one CHAR segment, not code, or transforms rewrite them.
+    assert (SegmentType.CHAR, "'ABCD'") in scan("x = 'ABCD';")
+
+
+def test_msvc_quoted_name_does_not_pair_with_later_char() -> None:
+    # The lone `'` closing `vftable' must not open a multi-char constant that
+    # runs to the next `'` on the line, hiding the code in between.
+    segs = scan("p = &Foo::`vftable'; c = 'A';")
+    assert segs[0] == (SegmentType.CODE, "p = &Foo::`vftable'; c = ")
+    assert (SegmentType.CHAR, "'A'") in segs
+
+
 def test_line_comment_backslash_continuation() -> None:
     # A `//` comment ending in `\` continues onto the next line in C; that line
     # is comment, not code, so the scanner must not surface it as CODE.

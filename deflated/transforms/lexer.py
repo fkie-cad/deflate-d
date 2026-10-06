@@ -16,12 +16,14 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 
-# A well-formed C character literal: a single char or a standard escape,
-# closed on the same line. Decompilers (esp. MSVC C++ output) also emit lone
-# apostrophes inside special names such as ``Animal::`vftable'`` and
-# ``Foo::`scalar deleting destructor'``; those are *not* char literals, so a
-# ``'`` that does not match this is treated as ordinary code (see ``scan``).
-_CHAR_LIT = re.compile(r"'(?:\\(?:x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|[0-7]{1,3}|.)|[^'\\\n])'")
+# A well-formed C character constant: one or more chars / standard escapes,
+# closed on the same line. Multi-char constants (``'ABCD'``, an int magic value)
+# are common in decompiler output and are literals too. Decompilers (esp. MSVC
+# C++ output) also emit lone apostrophes inside special names such as
+# ``Animal::`vftable'`` and ``Foo::`scalar deleting destructor'``; those are
+# *not* char literals (see ``_closes_msvc_name``), and a ``'`` that does not
+# match this is treated as ordinary code (see ``scan``).
+_CHAR_LIT = re.compile(r"'(?:\\(?:x[0-9a-fA-F]+|u[0-9a-fA-F]{4}|[0-7]{1,3}|.)|[^'\\\n])+'")
 
 
 class SegmentType(StrEnum):
@@ -34,6 +36,16 @@ class SegmentType(StrEnum):
 
 
 Segment = tuple[SegmentType, str]
+
+
+def _closes_msvc_name(src: str, i: int) -> bool:
+    """True if the ``'`` at ``src[i]`` closes an MSVC backtick-quoted name such
+    as ``Animal::`vftable'``: a backtick on the same line, after any earlier
+    ``'``, is still open. Such a ``'`` must not start a char literal, or it would
+    pair with a later ``'`` on the line and hide the code between them.
+    """
+    line = src[src.rfind("\n", 0, i) + 1 : i]
+    return line.rfind("`") > line.rfind("'")
 
 
 def _asm_block_end(src: str, i: int, n: int) -> int | None:
@@ -161,7 +173,7 @@ def scan(src: str) -> list[Segment]:
                 i = end
                 start = end
         elif c == "'":
-            m = _CHAR_LIT.match(src, i)
+            m = None if _closes_msvc_name(src, i) else _CHAR_LIT.match(src, i)
             if m:
                 flush_code(i)
                 segments.append((SegmentType.CHAR, m.group(0)))
