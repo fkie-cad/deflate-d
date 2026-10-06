@@ -14,7 +14,7 @@ from collections import Counter
 
 from .base import Tier, Transform
 from .contextual import _IDENT, _RESERVED
-from .ctokens import ctokenize as _tok_offsets, match_delim as _match_delim, split_args as _split_args
+from .ctokens import CINT, CNUMBER, ctokenize as _tok_offsets, match_delimiter as _match_delim, split_args as _split_args
 from .lexer import SegmentType, scan
 
 
@@ -86,15 +86,11 @@ _OPERAND_START_OPS = frozenset({"(", "*", "&", "-", "~", "!", "+", "++", "--"})
 # Keywords that may precede a cast's `(` (a cast can follow `return`, `case`, ...)
 # without the parentheses being a call/grouping applied to a value.
 _CAST_PREV_KW = frozenset({"return", "case", "sizeof", "if", "while", "for", "switch", "do", "else", "goto"})
-_WCAST_NUM = re.compile(r"0[xX][0-9a-fA-F]+|\d+\.?\d*")
 _WCAST_IDENT = re.compile(r"[A-Za-z_]\w*")
 # Bit widths of the pseudo-width types, for the literal-narrowing guard in
 # :class:`StripWidthCasts`: stripping `(_DWORD)` off a literal that does not fit
 # the cast width (or any float literal) would truncate it and change the value.
 _WIDTH_BITS = {"_BYTE": 8, "_WORD": 16, "_DWORD": 32, "_QWORD": 64, "_OWORD": 128}
-# A pure integer literal (no float point/exponent). ``_WCAST_NUM`` would also
-# match floats, so this stricter pattern is what the narrowing guard reasons on.
-_WCAST_INT = re.compile(r"0[xX][0-9a-fA-F]+|\d+")
 
 
 class StripWidthCasts(Transform):
@@ -163,7 +159,7 @@ class StripWidthCasts(Transform):
             if toks[i][0] == "(" and i + 2 < n and toks[i + 1][0] in self._types and toks[i + 2][0] == ")":
                 prev = toks[i - 1][0] if i > 0 else None
                 after = toks[i + 3][0] if i + 3 < n else None
-                if self._operand_starts(after) and not self._prev_is_value(prev) and self._literal_safe(toks[i + 1][0], toks, i + 3, n, code):
+                if self._operand_starts(after) and not self._prev_is_value(prev) and self._literal_safe(toks[i + 1][0], toks, i + 3, n):
                     cuts.append((toks[i][1], toks[i + 2][2]))
                     i += 3
                     continue
@@ -173,13 +169,13 @@ class StripWidthCasts(Transform):
         return code
 
     @classmethod
-    def _literal_safe(cls, cast_type: str, toks, j: int, n: int, code: str) -> bool:
+    def _literal_safe(cls, cast_type: str, toks, j: int, n: int) -> bool:
         """Whether dropping ``(<cast_type>)`` is permitted for the operand beginning
         at token index ``j`` (or ``j >= n`` when the cast ends the input).
 
         A *narrowing* width cast on a literal can change the value: an integer
-        literal wider than the cast truncates, and a float (or a hex-float head
-        continued by ``.``/``p``) always truncates. We look past a single leading
+        literal wider than the cast truncates, and a float (``1.5``, ``1e3``,
+        ``0x1.8p3``) always truncates. We look past a single leading
         unary ``+``/``-``/``~`` and unwrap a parenthesised lone literal, so
         ``(_BYTE)-1`` (== 255, not -1), ``(_BYTE)~0`` (== 255), and
         ``(_BYTE)(0x1ff)`` (== 255) are all recognised as narrowing and declined.
@@ -193,43 +189,44 @@ class StripWidthCasts(Transform):
         """
         if j >= n:
             return True
-        tok, _, end = toks[j]
+        tok = toks[j][0]
         # Unwrap a parenthesised lone literal: ``(LIT)`` narrows exactly as ``LIT``
         # would; a multi-token expression in parens falls under the same trade as
         # a bare variable, so allow it.
         if tok == "(":
-            close = _match_delim(toks, j, "(", ")")
+            close = _match_delim(toks, j)
             if close == j + 2:
-                return cls._literal_safe(cast_type, toks, j + 1, n, code)
+                return cls._literal_safe(cast_type, toks, j + 1, n)
             return True
         # A leading unary sign/complement. ``+LIT`` keeps the value; ``-LIT``/``~LIT``
         # of an integer literal become a large positive under the unsigned width
-        # truncation, so the value always changes -> decline. On a variable the
-        # whole operand is an expression, which this guard does not police.
+        # truncation (and ``-`` of a float literal truncates anyway), so the value
+        # always changes -> decline. On a variable the whole operand is an
+        # expression, which this guard does not police.
         if tok in ("+", "-", "~"):
-            if j + 1 < n and _WCAST_INT.fullmatch(toks[j + 1][0]):
-                return cls._literal_safe(cast_type, toks, j + 1, n, code) if tok == "+" else False
+            if j + 1 < n and CNUMBER.fullmatch(toks[j + 1][0]):
+                return cls._literal_safe(cast_type, toks, j + 1, n) if tok == "+" else False
             return True
-        # A float literal operand: truncation always changes the value.
-        if _WCAST_NUM.fullmatch(tok) and "." in tok:
-            return False
-        if not _WCAST_INT.fullmatch(tok):
-            return True  # not an integer literal: existing (lossy) behaviour
-        # An integer head immediately followed by `.` or `p`/`P` is a hex-float
-        # literal (`0x1.8p3` tokenizes as `0x1` then `.8p3`); stripping truncates.
-        if end < len(code) and code[end] in ".pP":
+        if not CNUMBER.fullmatch(tok):
+            return True  # not a literal: existing (lossy) behaviour
+        # ``CINT``, not ``CNUMBER``: the narrowing guard below reasons about an
+        # integer value against a bit width, so a float literal operand must not
+        # reach it --- truncating one always changes the value, so decline.
+        m = CINT.fullmatch(tok)
+        if m is None:
             return False
         bits = _WIDTH_BITS.get(cast_type)
         if bits is None:
             return True
-        value = int(tok, 16) if tok[:2].lower() == "0x" else int(tok, 10)
+        digits = m.group(1)
+        value = int(digits, 16) if digits[:2].lower() == "0x" else int(digits, 10)
         return value < (1 << bits)
 
     @staticmethod
     def _operand_starts(tok: str | None) -> bool:
         if tok is None:
             return False
-        return bool(tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or _WCAST_NUM.fullmatch(tok) or tok[0] in "\"'")
+        return bool(tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or CNUMBER.fullmatch(tok) or tok[0] in "\"'")
 
     @staticmethod
     def _prev_is_value(prev: str | None) -> bool:
@@ -241,7 +238,7 @@ class StripWidthCasts(Transform):
             return False
         if prev == "sizeof":
             return True
-        return bool(prev in {")", "]"} or _WCAST_NUM.fullmatch(prev) or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW))
+        return bool(prev in {")", "]"} or CNUMBER.fullmatch(prev) or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW))
 
 
 class StripCallingConventions(Transform):
@@ -447,7 +444,7 @@ class StripTranslationWrappers(Transform):
             spec = self.WRAPPERS.get(toks[i][0])
             if spec and toks[i + 1][0] == "(":
                 prev = toks[i - 1][0] if i > 0 else None
-                close = _match_delim(toks, i + 1, "(", ")")
+                close = _match_delim(toks, i + 1)
                 # Skip a member access (`p->gettext(...)`) and a declarator (a
                 # gettext *prototype/definition* such as
                 # `char *dcgettext(const char *a, const char *msgid, int c) {` is
@@ -459,8 +456,8 @@ class StripTranslationWrappers(Transform):
                 is_def = close is not None and close + 1 < n and toks[close + 1][0] == "{"
                 if close is not None and not is_member and not is_declarator and not is_def:
                     arity, keep = spec
-                    args = _split_args(toks, i + 1, close)
-                    if len(args) == arity:
+                    args = _split_args(toks, i + 1)
+                    if args is not None and len(args) == arity:
                         lo_t, hi_t = args[keep]
                         if lo_t < hi_t:
                             msg = code[toks[lo_t][1] : toks[hi_t - 1][2]].strip()
@@ -843,11 +840,11 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
         # A `(` immediately followed by `*` is a declarator grouping wrapping the
         # real name (`(**init_proc())`), not this token's parameter list.
         if depth == 0 and _IDENT.fullmatch(t) and t not in _RESERVED and i + 1 < n and toks[i + 1][0] == "(" and (i + 2 >= n or toks[i + 2][0] != "*"):
-            close = _match_delim(toks, i + 1, "(", ")")
+            close = _match_delim(toks, i + 1)
             if close is not None:
                 bo = _body_open_after(toks, close, n)
                 if bo is not None:
-                    bc = _match_delim(toks, bo, "{", "}")
+                    bc = _match_delim(toks, bo)
                     if bc is not None:
                         out.append((t, seg_start, bo, bc, toks[bc][2]))
                         seg_start = toks[bc][2]
@@ -1145,7 +1142,7 @@ class TrimSpuriousArgs(Transform):
             if prev == "*" or (prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW):
                 i += 1
                 continue
-            close = _match_delim(toks, i + 1, "(", ")")
+            close = _match_delim(toks, i + 1)
             if close is None:
                 i += 1
                 continue
@@ -1153,8 +1150,8 @@ class TrimSpuriousArgs(Transform):
             if close + 1 < n and toks[close + 1][0] == "{":
                 i = close + 1
                 continue
-            args = _split_args(toks, i + 1, close)
-            if len(args) > arity:
+            args = _split_args(toks, i + 1)
+            if args is not None and len(args) > arity:
                 # Keep the first `arity` args; cut from the end of arg[arity-1]
                 # to just before `)`.
                 keep_hi_tok = args[arity - 1][1]  # one past last kept arg

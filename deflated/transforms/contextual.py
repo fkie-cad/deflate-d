@@ -14,7 +14,7 @@ import re
 import string
 
 from .base import Tier, Transform
-from .ctokens import ctokenize as _tok_offsets, match_delim as _match_delim
+from .ctokens import CINT, CNUMBER, ctokenize as _tok_offsets, match_delimiter as _match_delim
 from .lexer import SegmentType, scan
 
 # Keywords/types we must never hand out as a generated short name.
@@ -123,7 +123,7 @@ def _struct_body_spans(code: str) -> list[tuple[int, int]]:
             while j < n and _IDENT.fullmatch(toks[j][0]):  # optional tag name
                 j += 1
             if j < n and toks[j][0] == "{":
-                close = _match_delim(toks, j, "{", "}")
+                close = _match_delim(toks, j)
                 if close is not None:
                     spans.append((toks[j][1], toks[close][2]))
                     i = close + 1
@@ -631,7 +631,7 @@ class DropNullPointerCast(Transform):
             if toks[i][0] != "(":
                 i += 1
                 continue
-            close = _match_delim(toks, i, "(", ")")
+            close = _match_delim(toks, i)
             # Need a non-empty cast body and a token after the `)` to inspect.
             if close is None or close <= i + 1 or close + 1 >= n:
                 i += 1
@@ -665,7 +665,7 @@ class DropNullPointerCast(Transform):
             # grouping re-checks the token after the closing paren. (Decompilers
             # don't emit this double-paren shape, so this only restores the
             # pass's stated decline-when-ambiguous contract.)
-            if before == "(" and after == ")" and _match_delim(toks, i - 1, "(", ")") == null_idx + 1:
+            if before == "(" and after == ")" and _match_delim(toks, i - 1) == null_idx + 1:
                 outer_before = toks[i - 2][0] if i >= 2 else None
                 is_call = outer_before is not None and (
                     outer_before in {")", "]"} or (_IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
@@ -721,7 +721,6 @@ class AddressOfIndexToOffset(Transform):
     # ``&base[n]`` in isolation would re-associate (and drop the ``&``). Mirrors
     # ``DerefOffsetToIndex._BLOCK_AFTER``.
     _BLOCK_AFTER = frozenset({".", "->", "(", "[", "++", "--"})
-    _NUM = re.compile(r"0[xX][0-9a-fA-F]+|\d+")
 
     def apply(self, code: str) -> str:
         toks = _tok_offsets(code)
@@ -730,15 +729,18 @@ class AddressOfIndexToOffset(Transform):
         i = 0
         while i + 4 < n:
             if toks[i][0] == "&" and _IDENT.fullmatch(toks[i + 1][0]) and toks[i + 2][0] == "[":
-                close = _match_delim(toks, i + 2, "[", "]")
+                close = _match_delim(toks, i + 2)
                 prev = toks[i - 1][0] if i > 0 else None
                 # `&` is binary (bitwise-and) only after a value: a non-keyword
                 # identifier, a number, or a closing `)`/`]`. After a keyword
                 # (`return`), an operator, or `(`/`,`/`;` it is unary address-of.
-                is_value = prev is not None and (prev in self._VALUE_BEFORE or self._NUM.fullmatch(prev) or (_IDENT.fullmatch(prev) and prev not in _RESERVED))
+                is_value = prev is not None and (prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT.fullmatch(prev) and prev not in _RESERVED))
                 unary = not is_value
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
-                if close == i + 4 and unary and self._NUM.fullmatch(toks[i + 3][0]) and after not in self._BLOCK_AFTER:
+                # ``CINT``, not ``CNUMBER``: a match here *performs* the rewrite,
+                # and only an integer is a valid subscript to fold into a pointer
+                # add. (Above, a match only declines, so the wider form is safe.)
+                if close == i + 4 and unary and CINT.fullmatch(toks[i + 3][0]) and after not in self._BLOCK_AFTER:
                     rep = f"({toks[i + 1][0]}+{toks[i + 3][0]})"
                     edits.append((toks[i][1], toks[close][2], rep))
                     i = close + 1

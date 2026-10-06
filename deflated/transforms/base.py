@@ -62,22 +62,22 @@ class Transform(ABC):
     """A single source-to-source rewrite.
 
     Subclasses set attributes `id`, `tier` and `description` and implement method `apply`.
-    To take effect, the *class* must be added to ``ORDERED_TRANSFORMS`` in `deflated.transforms.pipeline.py`;
+    To take effect, the *class* must be added to `ORDERED_TRANSFORMS` in `deflated.transforms.pipeline.py`;
     `build_pipeline` instantiates it once per pipeline, so the class must be constructible with no arguments and
     `apply` must be a pure function of its argument. It may record something for the caller to read afterward
     (`CompressPlaceholderNames.current_mapping`), as long as it never reads that record back.
     """
 
-    #: Stable short identifier, used on the CLI (``--exclude``) and in reports.
+    #: Stable short identifier, used on the CLI (`--exclude`) and in reports.
     id: str = "unknown"
     #: The tier at which this transform is included.
     tier: Tier = Tier.T0_RAW
-    #: Human-readable summary, shown by ``--list-verbose``.
+    #: Human-readable summary, shown by `--list-verbose`.
     description: str = "unknown"
 
     @abstractmethod
     def apply(self, code: str) -> str:
-        """Return ``code`` rewritten by this transform."""
+        """Return `code` rewritten by this transform."""
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<{self.id} {self.tier.name}>"

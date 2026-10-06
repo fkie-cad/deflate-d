@@ -14,6 +14,10 @@ class TestDerefOffsetToIndex:
             ("y = *(p + 4);", "y = p[4];"),
             ("z = *(ji + 8);", "z = ji[8];"),
             ("w = *(p + 0x10);", "w = p[0x10];"),  # hex offset preserved verbatim
+            # A suffixed literal offset is still a literal. Bug: `0x10u` / `16u`
+            # tokenize as `0x10` + `u`, so the offset looks like two tokens.
+            ("w = *(p + 0x10u);", "w = p[0x10u];"),
+            ("w = *(p + 16u);", "w = p[16u];"),
             ("a = *(&mw + 12);", "a = (&mw)[12];"),  # address-of base parenthesised
             ("return *(buf + 2);", "return buf[2];"),
             ("f(*(p + 1), 0);", "f(p[1], 0);"),
@@ -45,6 +49,15 @@ class TestDerefOffsetToIndex:
             # so it is declined too (lossless: a missed rewrite, never a wrong one).
             "y = ++*(p + 4);",
             "y = --*(p + 4);",
+            # Regression: a *float* literal before `*` is a value just as an integer
+            # is, so the `*` is the binary multiply. Matching the left operand with
+            # an integer-only pattern missed these and produced `x = 1.5 a[4];` --
+            # invalid C with the multiply gone.
+            "x = 1.5 * (a + 4);",
+            "x = 2.0f * (a + 4);",
+            "x = 1e3 * (a + 4);",
+            "x = .5 * (a + 4);",
+            "x = 0x1p3 * (a + 4);",
         ],
     )
     def test_kept(self, src) -> None:

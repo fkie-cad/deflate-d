@@ -23,6 +23,12 @@ class TestCompoundAssignment:
             ("a = a + f(x, y);", "a += f(x, y);"),
             ("a = a + (b - c);", "a += (b - c);"),
             ("a = a + -b;", "a += -b;"),  # unary minus is not an infix operator
+            # A literal remainder is atomic, whatever its spelling. Bug: the sign
+            # of an exponent (`1e-3` -> `1`,`e`,`-`,`3`) is read as a top-level
+            # infix operator, so the fold is wrongly declined.
+            ("a = a * 1e-3;", "a *= 1e-3;"),
+            ("a = a * 2.5e-3f;", "a *= 2.5e-3f;"),
+            ("a = a - 1e+3;", "a -= 1e+3;"),
         ],
     )
     def test_folded(self, src, expected) -> None:

@@ -2,7 +2,7 @@
 """
 Command-line entry point: reformat decompiler output at a chosen reduction tier.
 
-See ``--help`` for options and the README for usage examples.
+See `--help` for options and the README for usage examples.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from .transforms.pipeline import ORDERED_TRANSFORMS
 
 
 def _read(path: str) -> str:
-    """Read ``path`` (file-path or stdin for "-") as UTF-8 with ``surrogateescape``.
+    """Read `path` (file-path or stdin for "-") as UTF-8 with `surrogateescape`.
 
-    Undecodable bytes become lone surrogates instead of U+FFFD, so ``_write`` can restore them and non-UTF-8 input
+    Undecodable bytes become lone surrogates instead of U+FFFD, so `_write` can restore them and non-UTF-8 input
     passes through every tier unchanged.
     """
     if path == "-":
@@ -31,9 +31,9 @@ def _read(path: str) -> str:
 
 
 def _write(text: str) -> None:
-    """Write ``text`` to stdout, turning lone surrogates from ``_read`` back into the original bytes.
+    """Write `text` to stdout, turning lone surrogates from `_read` back into the original bytes.
 
-    Falls back to a plain text write when stdout has no binary buffer (e.g. a ``StringIO``).
+    Falls back to a plain text write when stdout has no binary buffer (e.g. a `StringIO`).
     """
     buf = getattr(sys.stdout, "buffer", None)
     if buf is None:
@@ -46,9 +46,9 @@ def _write(text: str) -> None:
 
 def _list_transforms(verbose: bool = False) -> None:
     """
-    Print the transform ids grouped by tier, in pipeline order (for ``--list``).
+    Print the transform ids grouped by tier, in pipeline order (for `--list`).
 
-    With ``verbose`` (``--list-verbose``), each id is followed by its description.
+    With `verbose` (`--list-verbose`), each id is followed by its description.
     """
     print("Transforms by tier (cumulative):")
     print("(use the ID with --exclude)")
@@ -65,10 +65,10 @@ def _list_transforms(verbose: bool = False) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """
-    Build the argument parser for the ``deflate-d`` CLI.
+    Build the argument parser for the `deflate-d` CLI.
 
-    Defines the input ``file`` (or ``-`` for stdin), ``--tier``, ``--exclude``, ``--list`` and ``--list-verbose``.
-    Values are returned as given; ``main`` validates the tier and the excluded ids.
+    Defines the input `file` (or `-` for stdin), `--tier`, `--exclude`, `--list` and `--list-verbose`.
+    Values are returned as given; `main` validates the tier and the excluded ids.
     """
     parser = argparse.ArgumentParser(prog="deflate-d", description="Reformat decompiler output (DEFLATE-D).")
     parser.add_argument("file", nargs="?", help="input file, or '-' for stdin")
@@ -87,9 +87,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: List[str] | None = None) -> int:
     """
-    Run the ``deflate-d`` CLI on ``argv`` (default: ``sys.argv[1:]``).
+    Run the `deflate-d` CLI on `argv` (default: `sys.argv[1:]`).
 
-    Reads the input, applies the pipeline for ``--tier`` minus ``--exclude``, and writes the result to stdout.
+    Reads the input, applies the pipeline for `--tier` minus `--exclude`, and writes the result to stdout.
     Returns 0 on success. Usage errors (no input, unknown tier or transform id, unreadable file) exit with code 2.
     """
     parser = build_arg_parser()

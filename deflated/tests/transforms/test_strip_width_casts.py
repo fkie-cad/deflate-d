@@ -69,6 +69,17 @@ class TestStripWidthCasts:
             "x = (_BYTE)~0;",
             "x = (_BYTE)(0x1ff);",
             "x = (_WORD)-0x12345;",
+            # A float literal without a `.` (exponent form) truncates too. Bug:
+            # `1e3` tokenizes as `1` + `e3`, so the guard sees the fitting integer
+            # `1` and strips the cast: `(_BYTE)1e3` (== 232) becomes `1e3` (== 1000).
+            "x = (_BYTE)1e3;",
+            "x = (_DWORD)1e10;",
+            "x = (_BYTE)1e2f;",
+            "x = (_BYTE)-1e3;",
+            "x = (_BYTE)(1e3);",
+            # A suffixed integer literal is still range-checked.
+            "x = (_BYTE)0x1ffi64;",
+            "x = (_BYTE)300u;",
         ],
     )
     def test_kept(self, src) -> None:

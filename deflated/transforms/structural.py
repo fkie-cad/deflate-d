@@ -10,10 +10,12 @@ import re
 
 from .base import Tier, Transform
 from .ctokens import (
+    CINT,
+    CNUMBER,
     CToken,
     ctokenize as _tok_offsets,
-    has_top as _has_top,
-    match_delim as _match_delim,
+    has_top_level_token as _has_top_level_token,
+    match_delimiter as _match_delim,
     split_statements as _split_statements,
     word_before as _word_before,
 )
@@ -508,10 +510,10 @@ class RedundantCastElision(Transform):
         for i in range(n):
             if toks[i][0] != "(":
                 continue
-            cp = _match_delim(toks, i, "(", ")")
+            cp = _match_delim(toks, i)
             if cp is None or cp + 1 >= n or toks[cp + 1][0] != "(":
                 continue
-            cp2 = _match_delim(toks, cp + 1, "(", ")")
+            cp2 = _match_delim(toks, cp + 1)
             if cp2 is None:
                 continue
             g1 = [t[0] for t in toks[i + 1 : cp]]
@@ -638,7 +640,7 @@ def _branch(toks, start: int):
     if start >= n:
         return None
     if toks[start][0] == "{":
-        close = _match_delim(toks, start, "{", "}")
+        close = _match_delim(toks, start)
         if close is None:
             return None
         return _parse_assign(toks, start + 1, close), close + 1, toks[close][2]
@@ -709,7 +711,7 @@ class TernaryFromIfElse(Transform):
             if toks[i][0] != "if" or i + 1 >= n or toks[i + 1][0] != "(":
                 i += 1
                 continue
-            cp = _match_delim(toks, i + 1, "(", ")")
+            cp = _match_delim(toks, i + 1)
             if cp is None or cp <= i + 2:  # need a non-empty condition
                 i += 1
                 continue
@@ -733,9 +735,9 @@ class TernaryFromIfElse(Transform):
                 i += 1
                 continue
             if (
-                _has_top(toks, i + 2, cp, _COND_UNSAFE)
-                or _has_top(toks, r1_lo, r1_hi, _TERNARY_UNSAFE)
-                or _has_top(toks, r2_lo, r2_hi, _TERNARY_UNSAFE)
+                _has_top_level_token(toks, i + 2, cp, _COND_UNSAFE)
+                or _has_top_level_token(toks, r1_lo, r1_hi, _TERNARY_UNSAFE)
+                or _has_top_level_token(toks, r2_lo, r2_hi, _TERNARY_UNSAFE)
             ):
                 i += 1
                 continue
@@ -813,10 +815,10 @@ class CanonicalizeControlFlow(Transform):
         return "".join(out)
 
 
-# An identifier, a number, and the statement keywords that can legitimately sit
-# just before a unary ``*`` deref or that must never be read as an operand value.
+# An identifier, and the statement keywords that can legitimately sit just
+# before a unary ``*`` deref or that must never be read as an operand value.
+# (Numeric operands are matched with ``CINT``.)
 _IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
-_NUM_RX = re.compile(r"^(?:0[xX][0-9a-fA-F]+|\d+)$")
 _NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
@@ -859,25 +861,23 @@ class MinimizeIntegerLiterals(Transform):
     tier = Tier.T2_STRUCTURAL
     description = "Re-spell a hex literal in decimal when shorter."
 
-    _HEX = re.compile(r"^0[xX][0-9a-fA-F]+$")
+    _HEX = re.compile(r"(0[xX][0-9a-fA-F]+)([uUlL]*|[uU]?i(?:8|16|32|64))")
     _INT_MAX = 0x7FFFFFFF
 
     def apply(self, code: str) -> str:
         edits: list[tuple[int, int, str]] = []
         for text, start, end in _tok_offsets(code):
-            if not self._HEX.match(text):
+            # A hex-float literal (`0x1f.0p3`) is one token and never matches.
+            m = self._HEX.fullmatch(text)
+            if m is None:
                 continue
-            # A hex-float literal (`0x1f.0p3`, `0x1fp3`) tokenizes as a hex head
-            # followed adjacently by `.`/`p`/`P`; re-spelling the head in decimal
-            # would change the value, so leave any hex token in that position.
-            if end < len(code) and code[end] in ".pP":
-                continue
-            value = int(text, 16)
+            hex_digits, suffix = m.groups()
+            value = int(hex_digits, 16)
             if value > self._INT_MAX:
                 continue  # wider than int: decimal would change the literal's type
             dec = str(value)
-            if len(dec) < len(text):
-                edits.append((start, end, dec))
+            if len(dec) < len(hex_digits):
+                edits.append((start, end, dec + suffix))
         if not edits:
             return code
         # Single forward pass: a hex-heavy file yields thousands of edits, so the
@@ -956,9 +956,13 @@ class DerefOffsetToIndex(Transform):
         while i < n:
             if toks[i][0] == "*" and i + 1 < n and toks[i + 1][0] == "(":
                 prev = toks[i - 1][0] if i > 0 else None
-                is_value = prev is not None and (prev in self._VALUE_BEFORE or _NUM_RX.match(prev) or (_IDENT_RX.match(prev) and prev not in _NONVALUE_KW))
+                # ``CNUMBER``, not ``CINT``: a match here only *declines* the
+                # rewrite, so the wider form is the lossless direction. A float
+                # left operand (``1.5 * (a + 4)``) is still a value, and reading
+                # its ``*`` as a deref would corrupt the multiply.
+                is_value = prev is not None and (prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT_RX.match(prev) and prev not in _NONVALUE_KW))
                 if not is_value:
-                    close = _match_delim(toks, i + 1, "(", ")")
+                    close = _match_delim(toks, i + 1)
                     if close is not None:
                         rep = self._index_form([t[0] for t in toks[i + 2 : close]])
                         after = toks[close + 1][0] if close + 1 < n else None
@@ -974,9 +978,9 @@ class DerefOffsetToIndex(Transform):
     @staticmethod
     def _index_form(inner: list[str]) -> str | None:
         """Return ``base[off]`` for an inner ``IDENT + NUM`` / ``& IDENT + NUM``."""
-        if len(inner) == 3 and _IDENT_RX.match(inner[0]) and inner[0] not in _NONVALUE_KW and inner[1] == "+" and _NUM_RX.match(inner[2]):
+        if len(inner) == 3 and _IDENT_RX.match(inner[0]) and inner[0] not in _NONVALUE_KW and inner[1] == "+" and CINT.fullmatch(inner[2]):
             return f"{inner[0]}[{inner[2]}]"
-        if len(inner) == 4 and inner[0] == "&" and _IDENT_RX.match(inner[1]) and inner[1] not in _NONVALUE_KW and inner[2] == "+" and _NUM_RX.match(inner[3]):
+        if len(inner) == 4 and inner[0] == "&" and _IDENT_RX.match(inner[1]) and inner[1] not in _NONVALUE_KW and inner[2] == "+" and CINT.fullmatch(inner[3]):
             return f"(&{inner[1]})[{inner[3]}]"
         return None
 

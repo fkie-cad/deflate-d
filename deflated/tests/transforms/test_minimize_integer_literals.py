@@ -18,6 +18,11 @@ class TestMinimizeIntegerLiterals:
             ("case 0x7b:", "case 123:"),
             ("y = 0x401000;", "y = 4198400;"),  # address, fits in int, shorter
             ("c = 0x28u;", "c = 40u;"),  # suffix left attached
+            ("c = 0x10ULL;", "c = 16ULL;"),  # multi-char suffix
+            ("c = 0x10L;", "c = 16L;"),
+            ("c = 0xffU;", "c = 255U;"),
+            ("c = 0x10i64;", "c = 16i64;"),  # Hex-Rays suffix
+            ("c = 0x7fui64;", "c = 127ui64;"),
             ("v = 0X1A;", "v = 26;"),  # uppercase prefix
         ],
     )
