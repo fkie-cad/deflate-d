@@ -1,11 +1,7 @@
 """T2 --- structural, lossless transforms.
 
 Information-preserving rewrites: nothing the model could use is removed, but the
-rendering gets smaller. The one exception split out of this tier is the removal
-of decompiler *warning* banners (e.g. ``/* WARNING: Could not recover
-jumptable */``), which carry genuine analyst signal --- that lives in
-``RemoveWarningComments`` at the reductive tier (T4), so T2 stays strictly
-information-preserving.
+rendering gets smaller.
 """
 
 from __future__ import annotations
@@ -92,6 +88,34 @@ def _looks_like_decl(s: str, first: str) -> bool:
     return bool(_DECL.match(s))
 
 
+class NormalizeFlagTemps(Transform):
+    r"""Normalize Binary Ninja's colon-spelled flag temporaries to plain identifiers.
+
+    Binary Ninja names a lifted condition-flag SSA value with a colon
+    (``cond:0``, ``cond:12_1``) --- the only place ``:`` appears inside what is
+    otherwise an identifier, and not legal C. The colon makes it a token the rest
+    of the pipeline can misread: a statement-leading ``cond:1 = ...`` looks like a
+    goto label ``cond:`` to ``cfg-canon``, which would drop it and orphan the
+    assignment. We therefore rewrite ``cond:N`` -> ``condN`` (CODE only) *first*,
+    before any structural pass inspects the text; the rewrite only drops a
+    non-C separator from one synthesized identifier, so it is information-
+    preserving (T2). The matching ``cond\d+`` placeholder in ``compress-names``
+    then compresses the normalized name at T3 like any other flag temp.
+
+    Runs at the head of the pipeline (before ``cfg-canon``/``ternary``) so the
+    colon never reaches a pass that could misinterpret it.
+    """
+
+    id = "flag-temps"
+    tier = Tier.T2_STRUCTURAL
+    description = "Normalize Binary Ninja colon-flag temporaries into plain identifiers."
+
+    _RX = re.compile(r"\bcond:(\d+(?:_\d+)?)")
+
+    def apply(self, code: str) -> str:
+        return "".join((self._RX.sub(r"cond\1", t) if seg_type == SegmentType.CODE else t) for seg_type, t in scan(code))
+
+
 class RemoveComments(Transform):
     """Remove auto-generated line and block comments, *except* warning banners.
 
@@ -114,232 +138,6 @@ class RemoveComments(Transform):
 
     def apply(self, code: str) -> str:
         return strip_comments(code, keep_warnings=True)
-
-
-class RemoveWarningComments(Transform):
-    """Remove decompiler warning banners (``/* WARNING: ... */``).
-
-    Lossy by design: a warning banner tells the analyst the decompiler gave up
-    or guessed (unrecovered jumptables, type conflicts), which is real signal.
-    Dropping it is therefore gated at the reductive tier, separate from the
-    lossless comment removal at T2.
-    """
-
-    id = "comments-warning"
-    tier = Tier.T4_REDUCTIVE
-    description = "Remove the decompiler's WARNING unreliability banners."
-
-    def apply(self, code: str) -> str:
-        return "".join(" " if (seg_type == SegmentType.BLOCK_COMMENT and "WARNING" in text) else text for seg_type, text in scan(code))
-
-
-class DropCodePointerCast(Transform):
-    """Drop Ghidra's ``(code *)`` function-pointer casts on indirect calls.
-
-    Ghidra spells every indirect call through a data pointer as
-    ``(*(code *)PTR_x)()``. The cast to its synthetic ``code`` type carries no
-    analyst signal beyond "this is called through a pointer", and the pattern
-    recurs thousands of times in a single translation unit, so at the reductive
-    tier we drop the cast (``(*PTR_x)()``). Lossy because the function-pointer
-    typing hint is discarded --- hence T4, alongside the other genuine-signal
-    reductions.
-
-    Only the exact cast shape ``( code *+ )`` is removed. A multiplication
-    ``code * 2`` (no closing paren right after the stars) and a declaration
-    ``code *p`` (no surrounding parens) are never touched, and ``code`` inside a
-    longer identifier never matches --- the match is token-level.
-    """
-
-    id = "drop-code-cast"
-    tier = Tier.T4_REDUCTIVE
-    description = "Drop Ghidra's (code *) cast on an indirect call."
-
-    def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
-        n = len(toks)
-        cuts: list[tuple[int, int]] = []
-        i = 0
-        while i < n:
-            if toks[i][0] == "(" and i + 2 < n and toks[i + 1][0] == "code" and toks[i + 2][0] == "*":
-                j = i + 2
-                while j < n and toks[j][0] == "*":
-                    j += 1
-                if j < n and toks[j][0] == ")":
-                    cuts.append((toks[i][1], toks[j][2]))
-                    i = j + 1
-                    continue
-            i += 1
-        for lo, hi in reversed(cuts):
-            code = code[:lo] + code[hi:]
-        return code
-
-
-# Hex-Rays pseudo-width *types*: spellings that never occur in hand-written C, so
-# a value-context cast to one is unambiguously a decompiler width annotation.
-_WIDTH_CAST_TYPES = frozenset({"_BYTE", "_WORD", "_DWORD", "_QWORD", "_OWORD"})
-# A token that begins an operand (so a preceding `(TYPE)` is a cast, not a stray
-# parenthesised type): an opening paren, a prefix-unary operator, an identifier,
-# a number, or a string/char literal.
-_OPERAND_START_OPS = frozenset({"(", "*", "&", "-", "~", "!", "+", "++", "--"})
-# Keywords that may precede a cast's `(` (a cast can follow `return`, `case`, ...)
-# without the parentheses being a call/grouping applied to a value.
-_CAST_PREV_KW = frozenset({"return", "case", "sizeof", "if", "while", "for", "switch", "do", "else", "goto"})
-_WCAST_NUM = re.compile(r"0[xX][0-9a-fA-F]+|\d+\.?\d*")
-_WCAST_IDENT = re.compile(r"[A-Za-z_]\w*")
-# Bit widths of the pseudo-width types, for the literal-narrowing guard in
-# :class:`StripWidthCasts`: stripping `(_DWORD)` off a literal that does not fit
-# the cast width (or any float literal) would truncate it and change the value.
-_WIDTH_BITS = {"_BYTE": 8, "_WORD": 16, "_DWORD": 32, "_QWORD": 64, "_OWORD": 128}
-# A pure integer literal (no float point/exponent). ``_WCAST_NUM`` would also
-# match floats, so this stricter pattern is what the narrowing guard reasons on.
-_WCAST_INT = re.compile(r"0[xX][0-9a-fA-F]+|\d+")
-
-
-class StripWidthCasts(Transform):
-    """Drop Hex-Rays pseudo-width narrowing casts in value position.
-
-    Hex-Rays litters expressions with explicit width casts to its own pseudo-
-    width *types* (``(_BYTE)``, ``(_WORD)``, ``(_DWORD)``, ``(_QWORD)``,
-    ``(_OWORD)``) --- spellings that do not exist in hand-written C, so they are
-    pure artifacts of mapping fixed-width x86 operations back to source. We drop
-    the cast (``(_BYTE)gv`` -> ``gv``) where it sits in value position, keeping
-    the operand and the surrounding operation.
-
-    This is not value-preserving, and it is not merely the loss of a hint: the
-    cast performs a real truncation. ``(_BYTE)eax == 0`` asks whether the low
-    byte is zero, ``eax == 0`` asks about all 32 bits, and the two disagree for
-    every ``eax`` whose high bits are set. We accept that because the width is
-    usually an artifact of instruction selection rather than of the original
-    source, and because the operand's declared type still lets a reader recover
-    the intended reading --- a trade of fidelity for brevity that belongs in T4
-    alongside the other genuine-signal reductions, and never in a lossless tier.
-
-    Only the exact shape ``( <pseudo-width-type> )`` followed by an operand start
-    is removed. A pointer cast (``(_BYTE *)p`` --- a real reinterpretation whose
-    access width is load-bearing) keeps its ``*`` and is never matched; and
-    ``sizeof(_QWORD)`` or a call ``f(_QWORD)`` is excluded by the value-position
-    guard, so no operator-bearing or size-of context is ever touched. A cast on
-    a *literal* that the width would narrow is also left in place: stripping
-    ``(_DWORD)0x123456789`` would turn one constant into a different constant
-    (and a float operand always truncates). That guard is not what makes the
-    pass safe --- per above, it isn't safe --- it only excludes the one shape
-    where nothing left on the page could tell a reader what the value was meant
-    to be, unlike a variable whose declaration still carries the width.
-    Decompiler output never puts a width cast on a literal anyway (the operand
-    is always a recovered variable/expression), so the guard is defensive.
-
-    The pseudo-width spellings are the conservative, no-false-positive subset.
-    The conventional casts Hex-Rays also inserts (``(int)``, ``(char)``,
-    ``(unsigned int)``) carry slightly more signal and a real (if rare)
-    false-positive surface, so they are intentionally out of the default set.
-    """
-
-    id = "strip-width-cast"
-    tier = Tier.T4_REDUCTIVE
-    description = "Remove Hex-Rays pseudo-width casts, keeping load-bearing pointer casts."
-
-    def __init__(self, types: frozenset[str] | None = None) -> None:
-        self._types = types if types is not None else _WIDTH_CAST_TYPES
-
-    def apply(self, code: str) -> str:
-        # Stacked width casts (``(_DWORD)(_BYTE)x``) peel one layer per pass,
-        # because the inner cast's ``(`` is preceded by the outer cast's ``)`` (a
-        # value position the guard rejects); iterate to a fixed point so the pass
-        # is idempotent. Bounded by the number of casts.
-        prev = None
-        while code != prev:
-            prev = code
-            code = self._strip_once(code)
-        return code
-
-    def _strip_once(self, code: str) -> str:
-        toks = _tok_offsets(code)
-        n = len(toks)
-        cuts: list[tuple[int, int]] = []
-        i = 0
-        while i < n:
-            if toks[i][0] == "(" and i + 2 < n and toks[i + 1][0] in self._types and toks[i + 2][0] == ")":
-                prev = toks[i - 1][0] if i > 0 else None
-                after = toks[i + 3][0] if i + 3 < n else None
-                if self._operand_starts(after) and not self._prev_is_value(prev) and self._literal_safe(toks[i + 1][0], toks, i + 3, n, code):
-                    cuts.append((toks[i][1], toks[i + 2][2]))
-                    i += 3
-                    continue
-            i += 1
-        for lo, hi in reversed(cuts):
-            code = code[:lo] + code[hi:]
-        return code
-
-    @classmethod
-    def _literal_safe(cls, cast_type: str, toks, j: int, n: int, code: str) -> bool:
-        """Whether dropping ``(<cast_type>)`` is permitted for the operand beginning
-        at token index ``j`` (or ``j >= n`` when the cast ends the input).
-
-        A *narrowing* width cast on a literal can change the value: an integer
-        literal wider than the cast truncates, and a float (or a hex-float head
-        continued by ``.``/``p``) always truncates. We look past a single leading
-        unary ``+``/``-``/``~`` and unwrap a parenthesised lone literal, so
-        ``(_BYTE)-1`` (== 255, not -1), ``(_BYTE)~0`` (== 255), and
-        ``(_BYTE)(0x1ff)`` (== 255) are all recognised as narrowing and declined.
-
-        Variables and multi-token sub-expressions are not scrutinised, which is a
-        policy and not a safety proof: ``(_BYTE)eax`` -> ``eax`` can change the
-        value exactly as a narrowed literal does. The difference is recoverability
-        --- the variable's declaration still states the width, while a rewritten
-        constant leaves no trace of the original --- so the class accepts the
-        former as its T4 trade and this guard declines the latter.
-        """
-        if j >= n:
-            return True
-        tok, _, end = toks[j]
-        # Unwrap a parenthesised lone literal: ``(LIT)`` narrows exactly as ``LIT``
-        # would; a multi-token expression in parens falls under the same trade as
-        # a bare variable, so allow it.
-        if tok == "(":
-            close = _match_delim(toks, j, "(", ")")
-            if close == j + 2:
-                return cls._literal_safe(cast_type, toks, j + 1, n, code)
-            return True
-        # A leading unary sign/complement. ``+LIT`` keeps the value; ``-LIT``/``~LIT``
-        # of an integer literal become a large positive under the unsigned width
-        # truncation, so the value always changes -> decline. On a variable the
-        # whole operand is an expression, which this guard does not police.
-        if tok in ("+", "-", "~"):
-            if j + 1 < n and _WCAST_INT.fullmatch(toks[j + 1][0]):
-                return cls._literal_safe(cast_type, toks, j + 1, n, code) if tok == "+" else False
-            return True
-        # A float literal operand: truncation always changes the value.
-        if _WCAST_NUM.fullmatch(tok) and "." in tok:
-            return False
-        if not _WCAST_INT.fullmatch(tok):
-            return True  # not an integer literal: existing (lossy) behaviour
-        # An integer head immediately followed by `.` or `p`/`P` is a hex-float
-        # literal (`0x1.8p3` tokenizes as `0x1` then `.8p3`); stripping truncates.
-        if end < len(code) and code[end] in ".pP":
-            return False
-        bits = _WIDTH_BITS.get(cast_type)
-        if bits is None:
-            return True
-        value = int(tok, 16) if tok[:2].lower() == "0x" else int(tok, 10)
-        return value < (1 << bits)
-
-    @staticmethod
-    def _operand_starts(tok: str | None) -> bool:
-        if tok is None:
-            return False
-        return bool(tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or _WCAST_NUM.fullmatch(tok) or tok[0] in "\"'")
-
-    @staticmethod
-    def _prev_is_value(prev: str | None) -> bool:
-        # A value before `(` means the parens are a call/subscript/group applied
-        # to that value (``f(_QWORD)``, ``a[i](_QWORD)``), never a cast. Keywords
-        # such as ``return``/``sizeof`` are not values, but ``sizeof(_QWORD)`` is
-        # a size-of, so it is excluded here too.
-        if prev is None:
-            return False
-        if prev == "sizeof":
-            return True
-        return bool(prev in {")", "]"} or _WCAST_NUM.fullmatch(prev) or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW))
 
 
 class CoalesceDeclarations(Transform):
