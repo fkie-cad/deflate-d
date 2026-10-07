@@ -134,7 +134,7 @@ class TestTightenWhitespace:
         t = TightenWhitespace()
         assert t.apply("a = b * /* test */ c;") == "a=b*/* test */c;"
 
-    # --- Negative cases: spaces that must be kept (full _DANGER2 coverage) ---
+    # --- Negative cases: spaces that must be kept (full _FUSING_PAIRS coverage) ---
 
     def test_no_merge_increment_decrement(self) -> None:
         t = TightenWhitespace()
@@ -184,8 +184,8 @@ class TestTightenWhitespace:
         assert t.apply("f ( 'a' );") == "f('a');"
 
     def test_star_slash_then_slash_star(self) -> None:
-        # `* /` merges safely (not in _DANGER2), but the resulting `/ *` keeps
-        # its space (`/*` IS in _DANGER2): `a * / * b` -> `a*/ *b`.
+        # `* /` merges safely (not in _FUSING_PAIRS), but the resulting `/ *` keeps
+        # its space (`/*` IS in _FUSING_PAIRS): `a * / * b` -> `a*/ *b`.
         t = TightenWhitespace()
         assert t.apply("a * / * b;") == "a*/ *b;"
 
@@ -196,7 +196,7 @@ class TestTightenWhitespace:
         assert t.apply("a = b; // result") == "a=b;// result"
 
     def test_digits_are_word_chars(self) -> None:
-        # Digits belong to _WORD_CHARS, so digit-digit and letter-digit
+        # Digits are word chars, so digit-digit and letter-digit
         # boundaries keep their space; digit-operator boundaries drop it.
         t = TightenWhitespace()
         assert t.apply("x2 y3;") == "x2 y3;"
@@ -222,6 +222,49 @@ class TestTightenWhitespace:
         t = TightenWhitespace()
         assert t.apply("x = 0x1f . y;") == "x=0x1f .y;"
         assert "0x1f.y" not in t.apply("x = 0x1f . y;")
+
+    def test_dot_digit_not_fused_into_float(self) -> None:
+        # `x . 5` must not become `x.5`, which retokenizes as `x` followed by the float `.5`.
+        t = TightenWhitespace()
+        assert t.apply("y = x . 5;") == "y=x. 5;"
+
+    def test_identifier_ending_in_digit_dot_merges(self) -> None:
+        # An identifier is no number even if it ends in a digit, so `ab12 . x` tightens fully.
+        t = TightenWhitespace()
+        assert t.apply("y = ab12 . x;") == "y=ab12.x;"
+
+    def test_float_with_dot_and_exponent_not_extended(self) -> None:
+        # `1.e5` is one float; `.x` glued to it would extend that number token.
+        t = TightenWhitespace()
+        assert t.apply("y = 1.e5 . x;") == "y=1.e5 .x;"
+
+    def test_exponent_sign_not_fused_into_number(self) -> None:
+        # `0x1e+5` lexes as one invalid number (`e+` is an exponent), so `0x1e + 5` keeps the space before `+`.
+        # In `e+1` only `1` is a number, so the space before `.` stays and the one before `+` goes.
+        t = TightenWhitespace()
+        assert t.apply("y = 0x1e + 5;") == "y=0x1e +5;"
+        assert t.apply("y = 1e+5 . x;") == "y=1e+5 .x;"
+        assert t.apply("y = e + 1 . x;") == "y=e+1 .x;"
+        assert t.apply("y = 0x1e - 5;") == "y=0x1e -5;"
+        assert t.apply("y = 0x1P - 1;") == "y=0x1P -1;"
+
+    def test_hex_not_ending_in_exponent_letter_still_tightened(self) -> None:
+        # Guard: only a number ending in `e`/`E`/`p`/`P` keeps the space before a sign.
+        t = TightenWhitespace()
+        assert t.apply("x = 0xFA - 1;") == "x=0xFA-1;"
+        assert t.apply("x = 0x1f + z;") == "x=0x1f+z;"
+
+    def test_word_after_number_ending_in_dot_not_fused(self) -> None:
+        # `5.` is one float; `x` or `123` glued to it would extend that number token to `5.x` or `5.123`.
+        t = TightenWhitespace()
+        assert t.apply("y = 5. x;") == "y=5. x;"
+        assert t.apply("y = 5. 123;") == "y=5. 123;"
+
+    def test_gnu_case_range_keeps_spaces(self) -> None:
+        # GNU case ranges: `1...` would lex the dots into the number. The space after `...` is kept conservatively.
+        t = TightenWhitespace()
+        assert t.apply("case 1 ... 5:") == "case 1 ... 5:"
+        assert t.apply("case 0x1e ... 0x2f:") == "case 0x1e ... 0x2f:"
 
     def test_no_merge_scope_and_ptr_to_member(self) -> None:
         # C++ decompiler output: a label/ternary `:` next to a leading-scope `::`

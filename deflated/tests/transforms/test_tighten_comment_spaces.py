@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated.transforms import TightenCommentSpaces
 
 
@@ -74,3 +76,15 @@ class TestTightenCommentSpaces:
         assert "*/" not in out  # no fabricated terminator
         assert "b; c;" in out  # trailing bytes not dropped
         assert "never closed" in out  # interior still collapsed (lossless)
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "int x; /*/",  # unterminated at end of input: the `*` belongs to the opener
+            "int x; /*/\nint y;",  # unterminated, with a next line
+            "int x; /*/\n*/ int y;",  # closed on the next line
+            "int x; /**/",  # shortest closed comment
+        ],
+    )
+    def test_slash_star_slash_closed_only_by_a_real_closer(self, src) -> None:
+        assert TightenCommentSpaces().apply(src) == src

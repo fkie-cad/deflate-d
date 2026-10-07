@@ -17,7 +17,7 @@ from .contextual import (
 from .cosmetic import (
     CollapseBlankLines,
     CollapseInlineSpaces,
-    CollapseLineBreaks,
+    JoinLines,
     StripIndentation,
     StripTrailingWhitespace,
     TightenCommentSpaces,
@@ -130,7 +130,7 @@ ORDERED_TRANSFORMS: list[type[Transform]] = [
     StripIndentation,  # T1
     StripTrailingWhitespace,  # T1
     CollapseBlankLines,  # T1
-    CollapseLineBreaks,  # T1 (joins the tidied lines)
+    JoinLines,  # T1 (joins the tidied lines)
     TightenCommentSpaces,  # T1
     TightenWhitespace,  # T1 (runs last: tightens punct + operators)
 ]

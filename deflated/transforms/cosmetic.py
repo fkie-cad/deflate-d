@@ -1,48 +1,28 @@
-"""T1 --- cosmetic transforms.
+"""
+T1 cosmetic transforms: whitespace and layout changes only, so all of them are semantics-preserving.
 
-Formatting that exists only for human readers.  All strictly lossless: program
-semantics are untouched.  The space-editing passes run through the lexer
-(``map_code`` / ``scan``) and touch only code segments, so string, char, and
-comment interiors are preserved.  The line-oriented passes (indent / trailing /
-blank-line) consult ``protected_line_edges`` to skip string and char literal
-interiors --- including multi-line strings --- while still tidying comment
-whitespace (normalised by ``ws-comments`` and discarded at T2).
+No pass changes the inside of a string, char literal or `__asm` block. `ws-collapse`, `ws-tighten`, `ws-comments` and
+`ws-newlines` work on the segments from `scan`. `ws-indent`, `ws-trailing` and `ws-blanklines` work line by line and
+use `lines_with_protection` to skip line edges that lie inside a protected segment.
 """
 
 from __future__ import annotations
 
-from itertools import groupby
-
 import re
-import string
+from itertools import groupby, pairwise
 from typing import List
 
 from .base import Tier, Transform
-from .lexer import SegmentType, map_code, protected_line_edges, scan, string_is_terminated
+from .lexer import SegmentType, lines_with_protection, map_code, scan, string_is_terminated
 
-_INLINE_RUNS = re.compile(r"[ \t]{2,}")
-_COMMENT_SPACES = re.compile(r"[ \t]+")
+_MULTI_BLANKS = re.compile(r"[ \t]{2,}")
+_BLANKS = re.compile(r"[ \t]+")
+# A C pp-number (`.`? digit, then word chars, `.` and exponent signs) or an identifier, read left to right.
+_NUMBER_OR_IDENTIFIER = re.compile(r"(?P<number>\.?\d(?:[eEpP][+-]|[\w.])*)|(?P<identifier>[A-Za-z_]\w*)")
 
-
-def _preprocessor_flags(lines: list[str]) -> list[bool]:
-    """Flag each physical line that is a preprocessor directive or a continuation
-    of one (the previous directive line ended with a ``\\``). Such lines must stay
-    on their own line and keep their spacing, or the directive breaks."""
-    flags: list[bool] = []
-    in_directive = False
-    for line in lines:
-        is_pp = in_directive or line.lstrip().startswith("#")
-        flags.append(is_pp)
-        in_directive = is_pp and line.rstrip().endswith("\\")
-    return flags
-
-# Token-class character sets for whitespace tightening.
-_WORD_CHARS = frozenset(string.ascii_letters + string.digits + "_")
-_OP_CHARS = frozenset("+-*/%=<>!&|^~.:?")
-
-# Two operator chars whose adjacency would form a longer token (or start a
-# comment): removing the space between them would change tokenization.
-_DANGER2 = frozenset(
+# Two operator chars whose adjacency would form a longer C token (or start a comment):
+# removing the space between them would change how the code splits into C tokens.
+_FUSING_PAIRS = frozenset(
     {
         "++",
         "--",
@@ -65,15 +45,10 @@ _DANGER2 = frozenset(
         "^=",
         "/*",
         "//",
-        # C++ scope (``::``) and pointer-to-member (``.*``): decompilers of C++
-        # binaries emit both. Without these, ``case 1: ::f()`` fuses to the invalid
-        # ``:::`` (a ternary/label ``:`` glued to a leading-scope ``::``), and
-        # ``a . *p`` fuses to the pointer-to-member ``a.*p`` --- both retokenize.
+        # C++ scope and pointer-to-member: decompilers of C++ binaries emit both.
         "::",
         ".*",
-        # C alternative-token digraphs: removing the space would fuse them into the
-        # punctuator they spell (`<:`=`[`, `:>`=`]`, `<%`=`{`, `%>`=`}`, `%:`=`#`).
-        # Decompilers do not emit digraphs, but keeping the space stays lossless.
+        # C digraphs (`<:` = `[` etc.): decompilers don't emit them, but keeping the space stays lossless.
         "<:",
         ":>",
         "<%",
@@ -83,29 +58,58 @@ _DANGER2 = frozenset(
 )
 
 
-def _word_boundary(a: str, b: str) -> bool:
-    return a in _WORD_CHARS and b in _WORD_CHARS
+def _is_word_char(character: str) -> bool:
+    """Check whether the input character is a word character in C."""
+    return character.isalnum() or character == "_"
 
 
-def _dangerous_op_pair(a: str, b: str) -> bool:
-    return a in _OP_CHARS and b in _OP_CHARS and a + b in _DANGER2
+def _forms_pp_number(left: str, right: str) -> bool:
+    """
+    True if removing the space between `left` and `right` would extend or start a number, so the space must stay.
+
+    C reads a number from a digit (or `.` + digit) on, taking all following digits, letters, `.` and the `+`/`-` of an
+    exponent (`e+`, `p-`, ...). Only reading `left` from the start shows where its last number begins.
+    Space kept: `5 .x`, `1.e5 .x`, `0x1e +5`, `5. x` (number before) and `x. 5`, `1 . 5` (`.` + digit).
+    Space removed: `ab12 .x` becomes `ab12.x` (identifier, even if it ends in a digit), `x. y` becomes `x.y`.
+    """
+    words = list(_NUMBER_OR_IDENTIFIER.finditer(left))
+    if words and words[-1].end() == len(left) and words[-1].lastgroup == "number":
+        return _is_word_char(right[0]) or right[0] == "." or (right[0] in "+-" and left[-1] in "eEpP")
+    return left[-1] == "." and right[0].isdigit()
 
 
-def _number_dot(left: str, b: str) -> bool:
-    """True if joining ``left`` (the text accumulated so far) and the next token
-    starting with ``b`` would fuse a numeric literal and ``.`` into one pp-number
-    (``5 . x`` -> ``5.x`` retokenizes ``5.`` as a float).
+def _needs_space(left: str, right: str) -> bool:
+    """
+    True if the space between the non-empty tokens `left` and `right` cannot be removed without changing how they lex.
+    """
+    a, b = left[-1], right[0]
+    return (_is_word_char(a) and _is_word_char(b)) or a + b in _FUSING_PAIRS or _forms_pp_number(left, right)
 
-    The left side is numeric when its trailing word-run starts with a digit ---
-    this covers decimal (``10``) *and* hex (``0x1f``, which ends in a letter, so a
-    last-char ``isdigit`` test would miss it). We scan back only over that trailing
-    word-run (cheap), not the whole accumulated line."""
-    if b == ".":
-        i = len(left)
-        while i > 0 and (left[i - 1].isalnum() or left[i - 1] == "_"):
-            i -= 1
-        return i < len(left) and left[i].isdigit()
-    return left.endswith(".") and b.isdigit()
+
+def _tighten_line(line: str) -> str:
+    """
+    Remove all spaces and tabs from `line`, keeping a single space only where `_needs_space` requires one.
+    """
+    parts = _BLANKS.split(line.strip(" \t"))
+    tightened_line: str = parts[0]
+    for left, right in pairwise(parts):
+        if _needs_space(left, right):
+            tightened_line += " "
+        tightened_line += right
+    return tightened_line
+
+
+def _directive_flags(all_lines: List[str]) -> List[bool]:
+    """
+    Return for each line of `all_lines` whether it is a preprocessor directive or a `\\` continuation of one.
+    """
+    flags: List[bool] = []
+    inside_directive = False
+    for line in all_lines:
+        is_directive = inside_directive or line.lstrip().startswith("#")
+        flags.append(is_directive)
+        inside_directive = is_directive and line.rstrip().endswith("\\")
+    return flags
 
 
 class CollapseInlineSpaces(Transform):
@@ -116,67 +120,57 @@ class CollapseInlineSpaces(Transform):
     description = "Collapse any combination of 2+ spaces/tabs into a single space in code."
 
     def apply(self, code: str) -> str:
-        return map_code(code, lambda s: _INLINE_RUNS.sub(" ", s))
+        return map_code(code, lambda s: _MULTI_BLANKS.sub(" ", s))
 
 
 class StripIndentation(Transform):
-    """Remove leading whitespace from every line (lossless; braces carry nesting)."""
+    """Remove leading whitespace from each line, unless the line starts inside a string, char or `__asm` block."""
 
     id = "ws-indent"
     tier = Tier.T1_COSMETIC
     description = "Remove leading whitespace from each line."
 
     def apply(self, code: str) -> str:
-        edges = protected_line_edges(code)
-        return "\n".join(
-            line if lead else line.lstrip()
-            for line, (lead, _trail) in zip(code.split("\n"), edges)
-        )
+        return "\n".join(line if starts_protected else line.lstrip() for line, starts_protected, _ in lines_with_protection(code))
 
 
 class StripTrailingWhitespace(Transform):
-    """Strip trailing whitespace from every line."""
+    """Remove trailing whitespace from each line, unless the line ends inside a string, char or `__asm` block."""
 
     id = "ws-trailing"
     tier = Tier.T1_COSMETIC
     description = "Remove trailing whitespace from each line."
 
     def apply(self, code: str) -> str:
-        edges = protected_line_edges(code)
-        return "\n".join(
-            line if trail else line.rstrip()
-            for line, (_lead, trail) in zip(code.split("\n"), edges)
-        )
+        return "\n".join(line if ends_protected else line.rstrip() for line, _, ends_protected in lines_with_protection(code))
 
 
 class CollapseBlankLines(Transform):
-    """Collapse 2+ consecutive blank lines to one; drop leading/trailing blanks."""
+    """
+    Reduce each run of blank or whitespace-only lines to one blank line and remove blank lines at the start and end.
+    """
 
     id = "ws-blanklines"
     tier = Tier.T1_COSMETIC
     description = "Collapse consecutive blank lines to one and drop leading/trailing blanks."
 
     def apply(self, code: str) -> str:
-        remaining_lines: List[str] = []
-        for line, (lead, _trail) in zip(code.split("\n"), protected_line_edges(code)):
-            if line.strip() or lead:  # real content, or protected string interior
-                remaining_lines.append(line)
-            elif remaining_lines and remaining_lines[-1] != "":
-                remaining_lines.append("")
-        if remaining_lines and remaining_lines[-1] == "":
-            remaining_lines.pop()
-        return "\n".join(remaining_lines)
+        transformed_code_lines: List[str] = []
+        for line, starts_protected, _ in lines_with_protection(code):
+            if line.strip() or starts_protected:  # real content, or protected string interior
+                transformed_code_lines.append(line)
+            elif transformed_code_lines and transformed_code_lines[-1] != "":
+                transformed_code_lines.append("")
+        if transformed_code_lines and transformed_code_lines[-1] == "":
+            transformed_code_lines.pop()
+        return "\n".join(transformed_code_lines)
 
 
 class TightenCommentSpaces(Transform):
-    """Collapse whitespace inside comments and strip leading/trailing space.
+    """
+    In every comment, collapse runs of spaces/tabs to one space and strip leading and trailing whitespace.
 
-    Applies to line comments (``//``) and block comments (``/* */``): every
-    run of spaces/tabs (including a lone tab) collapses to one space, and
-    leading/trailing horizontal whitespace is stripped entirely.  Newlines
-    inside multi-line block comments are left intact.  Code, strings, and
-    char literals are untouched.  Strictly lossless: the compiler discards
-    comments.
+    Newlines in block comments are kept, and an unterminated `/*` does not get a `*/` added.
     """
 
     id = "ws-comments"
@@ -184,46 +178,31 @@ class TightenCommentSpaces(Transform):
     description = "Strip and collapse whitespace inside comments."
 
     def apply(self, code: str) -> str:
-        resulting_code: List[str] = []
+        out: List[str] = []
         for seg_type, text in scan(code):
             if seg_type == SegmentType.LINE_COMMENT:
-                comment_content = _COMMENT_SPACES.sub(" ", text[2:]).strip()
-                resulting_code.append("//" + comment_content)
+                interior = _BLANKS.sub(" ", text[2:]).strip()
+                out.append("//" + interior)
             elif seg_type == SegmentType.BLOCK_COMMENT:
                 # An unterminated `/* ...` (run to EOF by the lexer) has no closer
                 # to strip or re-append: keep the interior but don't fabricate `*/`.
-                has_close = text.endswith("*/")
-                inner = text[2:-2] if has_close else text[2:]
-                interior = _COMMENT_SPACES.sub(" ", inner).strip(" \t")
-                resulting_code.append("/*" + interior + ("*/" if has_close else ""))
+                is_closed = text.endswith("*/")
+                interior = text[2:-2] if is_closed else text[2:]
+                interior = _BLANKS.sub(" ", interior).strip(" \t")
+                out.append("/*" + interior + ("*/" if is_closed else ""))
             else:
-                resulting_code.append(text)
-        return "".join(resulting_code)
+                out.append(text)
+        return "".join(out)
 
 
 class TightenWhitespace(Transform):
-    """Remove spaces/tabs around punctuation and operators where lossless.
+    """
+    Remove every space or tab whose removal does not change how the code lexes (`while ( x )` -> `while(x)`).
 
-    Walks each line and drops every run of horizontal whitespace between two
-    tokens unless removing it would change tokenization. A single space is kept
-    only when (a) both sides are word characters --- ``int d`` must not become
-    ``intd`` --- or (b) both sides are operator characters whose adjacency would
-    form a longer token or a comment --- ``a - -b`` must not become ``a--b``,
-    ``a / *p`` must not become ``a/*p``. Every other boundary is tightened:
-    operand/operator (``f * 4`` -> ``f*4``, ``e == b`` -> ``e==b``) and anything
-    touching ``(){}[];,`` (``while ( true )`` -> ``while(true)``). Preprocessor
-    lines are left intact; runs through the scanner so literals are protected.
-    Strictly lossless.
-
-    Segment boundaries get one extra guard. An ``__asm { ... }`` block is a
-    separate (opaque) segment that begins with ``__asm`` --- a word character ---
-    so tightening a CODE segment's trailing whitespace away would glue a preceding
-    word token to it (``do __asm{...}`` -> ``do__asm{...}``). That both fuses the
-    ``do`` keyword into an identifier and, on any re-scan, stops ``__asm`` from
-    being recognised (the lexer needs a non-word char before it), de-protecting
-    the block. A single space is therefore restored at a CODE->ASM boundary when
-    the tightened code ends in a word character. (String/char segments start with
-    a quote --- a non-word char --- so they need no such guard.)
+    One space is kept where `_needs_space` requires it: between word characters (`int d`), between characters that
+    would fuse into another token (`a - -b`, `a / *p`), and where a number would absorb a `.`. Preprocessor lines are
+    left unchanged. A space is also kept before an `__asm` block if the code before it ends in a word character;
+    otherwise `do __asm{...}` becomes `do__asm{...}` and the lexer no longer recognises the block.
     """
 
     id = "ws-tighten"
@@ -232,102 +211,81 @@ class TightenWhitespace(Transform):
 
     def apply(self, code: str) -> str:
         segments = scan(code)
+        next_types = [seg_type for seg_type, _ in segments[1:]] + [None]
         out: List[str] = []
-        for idx, (seg_type, text) in enumerate(segments):
+        for (seg_type, text), next_type in zip(segments, next_types):
             if seg_type != SegmentType.CODE:
                 out.append(text)
                 continue
             tight = self._tighten(text)
-            nxt = segments[idx + 1] if idx + 1 < len(segments) else None
-            if nxt is not None and nxt[0] == SegmentType.ASM and tight and (tight[-1].isalnum() or tight[-1] == "_"):
+            if next_type == SegmentType.ASM and tight and _is_word_char(tight[-1]):
                 tight += " "
             out.append(tight)
         return "".join(out)
 
-    @classmethod
-    def _tighten(cls, text: str) -> str:
-        lines = text.split("\n")
-        pp = _preprocessor_flags(lines)
-        # Preprocessor directives (and their continuations) are left verbatim.
-        return "\n".join(line if pp[i] else cls._tighten_line(line) for i, line in enumerate(lines))
-
     @staticmethod
-    def _tighten_line(line: str) -> str:
-        code_parts: List[str] = re.split(r"[ \t]+", line.strip(" \t"))
-        result: str = code_parts[0]
-        for next_part in code_parts[1:]:
-            a, b = result[-1], next_part[0]
-            if _word_boundary(a, b) or _dangerous_op_pair(a, b) or _number_dot(result, b):
-                result += " "
-            result += next_part
-        return result
+    def _tighten(text: str) -> str:
+        """
+        Tighten each line of the CODE segment `text` with `_tighten_line`, leaving directive lines unchanged.
+        """
+        lines = text.split("\n")
+        return "\n".join(line if is_directive else _tighten_line(line) for line, is_directive in zip(lines, _directive_flags(lines)))
 
 
-class CollapseLineBreaks(Transform):
-    """Join lines into as few physical lines as possible.
+class JoinLines(Transform):
+    """
+    Join all lines with single spaces, except where a line break is needed.
 
-    The newline terminating a ``//`` comment is kept (removing it would swallow
-    the following code into the comment), and likewise the newline bounding a
-    frozen (unterminated) string literal is kept (removing it would glue the
-    malformed string content onto the next line of real code).  Each preprocessor
-    directive stays on its own line.  All other line breaks are replaced with a
-    single space.  The scanner protects string and char literal interiors.
+    A line break is kept after a `//` comment, before and after a frozen string, and around each preprocessor directive
+    (including its `\\` continuation lines).
     """
 
     id = "ws-newlines"
     tier = Tier.T1_COSMETIC
-    description = "Join lines into as few physical lines as possible, replacing all non-significant line breaks with a single space."
+    description = "Join lines into as few as possible, keeping only the line breaks the code needs."
 
     def apply(self, code: str) -> str:
-        resulting_code: List[str] = []
+        out: List[str] = []
         keep_following_newline = False  # prev segment bounds its line: // comment or frozen string
 
-        def append(s: str) -> None:
-            # Guard against gluing two word-char tokens across a segment boundary
-            # when the bounding newline is dropped, e.g. a keyword joined to an
-            # opaque `__asm{...}` block (`do\n__asm{...}` -> `do __asm{...}`, not
-            # `do__asm{...}`, which would also defeat the lexer's ASM protection on
-            # a re-scan). CODE->CODE joins already space-separate inside `_collapse`.
-            if s and resulting_code:
-                prev = resulting_code[-1]
-                if prev and (prev[-1].isalnum() or prev[-1] == "_") and (s[0].isalnum() or s[0] == "_"):
-                    resulting_code.append(" ")
-            resulting_code.append(s)
+        def append_separated(s: str) -> None:
+            # Keep a space where a dropped newline would glue two word chars: do\n__asm{...} -> do __asm{...}.
+            if s and out:
+                prev = out[-1]
+                if prev and _is_word_char(prev[-1]) and _is_word_char(s[0]):
+                    out.append(" ")
+            out.append(s)
 
         for seg_type, text in scan(code):
             if seg_type != SegmentType.CODE:
-                frozen_string = seg_type == SegmentType.STRING and not string_is_terminated(text)
-                # A frozen (malformed/unterminated) string must be isolated on its
-                # own physical line: keep the newline BEFORE it as well as after.
-                # Otherwise its head joins the preceding code into one long line,
-                # and a later re-scan (ws-tighten) meets the stray quote mid-line
-                # and backtracks the freeze across that whole joined line,
-                # swallowing tens of KB of real code into one opaque literal.
-                if frozen_string and resulting_code and not resulting_code[-1].endswith("\n"):
-                    resulting_code.append("\n")
-                append(text)
-                keep_following_newline = seg_type == SegmentType.LINE_COMMENT or frozen_string
+                is_frozen_string = seg_type == SegmentType.STRING and not string_is_terminated(text)
+                # Start a frozen string on its own line. If it were joined to the previous code, a later re-scan would
+                # see its stray quote mid-line and freeze the whole joined line as one literal.
+                if is_frozen_string and out and not out[-1].endswith("\n"):
+                    out.append("\n")
+                append_separated(text)
+                keep_following_newline = seg_type == SegmentType.LINE_COMMENT or is_frozen_string
                 continue
             if keep_following_newline:
-                resulting_code.append("\n")
-            append(self._collapse(text))
+                out.append("\n")
+            append_separated(self._collapse(text))
             keep_following_newline = False
-        return "".join(resulting_code)
+        return "".join(out)
 
     @staticmethod
     def _collapse(text: str) -> str:
-        """Join runs of ordinary lines with single spaces, dropping blank lines;
-        each preprocessor directive --- and its ``\\``-continuation lines --- stays
-        on its own line."""
+        """
+        Join the lines of the CODE segment `text` with single spaces and drop blank lines; directive lines stay separate.
+        """
         lines = text.split("\n")
-        flags = _preprocessor_flags(lines)
-        resulting_code: List[str] = []
-        for is_pp, group in groupby(zip(lines, flags), key=lambda pair: pair[1]):
+        flags = _directive_flags(lines)
+        out: List[str] = []
+        for is_directive, group in groupby(zip(lines, flags), key=lambda pair: pair[1]):
             group_lines = [line for line, _ in group]
-            if is_pp:
-                resulting_code.extend(line.strip() for line in group_lines)
+            if is_directive:
+                out.extend(line.strip() for line in group_lines)
             else:
                 joined = " ".join(line.strip() for line in group_lines if line.strip())
                 if joined:
-                    resulting_code.append(joined)
-        return "\n".join(resulting_code)
+                    out.append(joined)
+        return "\n".join(out)

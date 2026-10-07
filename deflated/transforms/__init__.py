@@ -15,7 +15,7 @@ from .contextual import (
 from .cosmetic import (
     CollapseBlankLines,
     CollapseInlineSpaces,
-    CollapseLineBreaks,
+    JoinLines,
     StripIndentation,
     StripTrailingWhitespace,
     TightenCommentSpaces,
@@ -60,7 +60,7 @@ __all__ = [
     "transform",
     "CollapseBlankLines",
     "CollapseInlineSpaces",
-    "CollapseLineBreaks",
+    "JoinLines",
     "StripIndentation",
     "StripTrailingWhitespace",
     "TightenCommentSpaces",

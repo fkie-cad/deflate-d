@@ -6,7 +6,7 @@ from deflated import Tier, transform
 from deflated.transforms.lexer import (
     SegmentType,
     map_code,
-    protected_line_ends,
+    lines_with_protection,
     scan,
     string_is_terminated,
     strip_comments,
@@ -131,6 +131,7 @@ def test_map_code_edits_only_code() -> None:
     src = "a = \"a\"; // a\nb = 'a'; /* a */"
     assert map_code(src, str.upper) == "A = \"a\"; // a\nB = 'a'; /* a */"
 
+
 def test_msvc_quoted_name() -> None:
     # MSVC C++ symbols contain a lone apostrophe (`vftable'`); it must NOT start a
     # char literal, or the rest of the line escapes every transform.
@@ -209,10 +210,10 @@ def test_unterminated_string_freeze_swallows_earlier_segments_on_its_line() -> N
     #   CODE 'x = ', STRING '"a"', CODE ' + ', CHAR "'b'"   (and ' + ' is pending code)
     # The freeze moves back to the line's first string `"a"`, pops everything emitted from there on, and emits the
     # whole rest of the line as one STRING. Only the code before the first string survives.
-    src = "x = \"a\" + 'b' + \"c\ny;"
+    src = 'x = "a" + \'b\' + "c\ny;'
     assert scan(src) == [
         (SegmentType.CODE, "x = "),
-        (SegmentType.STRING, "\"a\" + 'b' + \"c"),
+        (SegmentType.STRING, '"a" + \'b\' + "c'),
         (SegmentType.CODE, "\ny;"),
     ]
 
@@ -268,34 +269,33 @@ def test_unterminated_asm_block_runs_to_end() -> None:
     assert scan(src) == [(SegmentType.CODE, "x;\n"), (SegmentType.ASM, "__asm {\n  nop\ny;")]
 
 
-def test_protected_line_ends_marks_asm_interior() -> None:
+def test_lines_with_protection_marks_asm_interior() -> None:
     # An `__asm { ... }` block is a frozen opaque region, so its interior lines
     # must report as protected (like a multi-line string) --- otherwise the
     # line-oriented cosmetic passes would de-indent its assembly operands.
     src = "x = 1;\n__asm\n{\n  vmovdqa xmm7, foo\n}\ny = 2;\n"
-    edges = protected_line_ends(src)
-    lines = src.split("\n")
-    assert lines[0] == "x = 1;" and edges[0] == (False, False)  # plain code
-    assert lines[3] == "  vmovdqa xmm7, foo" and edges[3] == (True, True)  # asm interior
+    edges = lines_with_protection(src)
+    assert edges[0] == ("x = 1;", False, False)  # plain code
+    assert edges[3] == ("  vmovdqa xmm7, foo", True, True)  # asm interior
 
 
-def test_protected_line_ends_start_and_end_differ() -> None:
+def test_lines_with_protection_start_and_end_differ() -> None:
     # A string continued with `\`-newline opens at the end of one line and closes at the start of the next.
-    assert protected_line_ends('x = "a \\\nb";') == [(False, True), (True, False)]
+    assert lines_with_protection('x = "a \\\nb";') == [('x = "a \\', False, True), ('b";', True, False)]
     # A char literal at a line edge protects that edge only.
-    assert protected_line_ends("'a' + b") == [(True, False)]
+    assert lines_with_protection("'a' + b") == [("'a' + b", True, False)]
 
 
-def test_protected_line_ends_empty_lines() -> None:
+def test_lines_with_protection_empty_lines() -> None:
     # An empty line inside an `__asm` block is protected, an empty line in plain code is not.
-    edges = protected_line_ends("__asm {\n\n  nop }\n\nx;")
-    assert edges[1] == (True, True)
-    assert edges[3] == (False, False)
+    edges = lines_with_protection("__asm {\n\n  nop }\n\nx;")
+    assert edges[1] == ("", True, True)
+    assert edges[3] == ("", False, False)
 
 
 def test_t1_preserves_asm_block_interior() -> None:
     # Regression: the line-oriented T1 passes (ws-indent/-trailing/-blanklines)
-    # once de-indented `__asm` interiors because `protected_line_ends` only
+    # once de-indented `__asm` interiors because `lines_with_protection` only
     # guarded string/char literals. The assembly text must survive T1 verbatim.
     src = "void f(){\n  __asm\n    {\n      vmovdqa xmm7, cs:foo\n    }\n  x = 1;\n}\n"
     out = transform(src, Tier.T1_COSMETIC)

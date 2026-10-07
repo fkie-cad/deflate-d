@@ -146,9 +146,9 @@ def strip_comments(code: str, keep_warnings: bool = False) -> str:
     return "".join(resulting_code)
 
 
-def protected_line_ends(code: str) -> List[Tuple[bool, bool]]:
+def lines_with_protection(code: str) -> List[Tuple[str, bool, bool]]:
     """
-    Return one `(starts_protected, ends_protected)` pair of bools per line of `code`.
+    Split `code` at linebreaks and return one `(line, starts_protected, ends_protected)` triple per line.
 
     `starts_protected` is True if the line's first character is inside a string, char literal or `__asm` block, so its
     leading whitespace must be kept. `ends_protected` is the same for the last character and trailing whitespace.
@@ -163,13 +163,15 @@ def protected_line_ends(code: str) -> List[Tuple[bool, bool]]:
             protected_mask[offset : offset + len(text)] = b"\x01" * len(text)
         offset += len(text)
 
-    protected_ends: List[Tuple[bool, bool]] = []
+    protected_ends: List[Tuple[str, bool, bool]] = []
     line_start = 0
     for line in code.split("\n"):
         if line:
-            protected_ends.append((bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1])))
+            protected_ends.append(
+                (line, bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1]))
+            )
         else:
             inside_protected_area = bool(protected_mask[line_start]) if line_start < len(code) else False
-            protected_ends.append((inside_protected_area, inside_protected_area))
+            protected_ends.append((line, inside_protected_area, inside_protected_area))
         line_start += len(line) + 1  # + 1 for the "\n" that split() removed
     return protected_ends
