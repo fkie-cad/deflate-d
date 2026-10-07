@@ -1,9 +1,16 @@
-"""Tests for the C lexer (scan / strip_comments)."""
+"""Tests for the C lexer."""
 
 from __future__ import annotations
 
 from deflated import Tier, transform
-from deflated.transforms.lexer import SegmentType, protected_line_edges, scan, string_is_terminated, strip_comments
+from deflated.transforms.lexer import (
+    SegmentType,
+    map_code,
+    protected_line_ends,
+    scan,
+    string_is_terminated,
+    strip_comments,
+)
 
 
 def test_lexer_roundtrip() -> None:
@@ -32,6 +39,39 @@ def test_escaped_quote_inside_string_does_not_close() -> None:
     assert [t for k, t in segs if k == SegmentType.STRING] == ['"he said \\"hi\\""']
 
 
+def test_escaped_backslash_before_quote_closes_string() -> None:
+    # In `"a\\"` the `\\` is an escaped backslash, so the following `"` closes the string.
+    src = r's = "a\\"; t = "b";'
+    assert scan(src) == [
+        (SegmentType.CODE, "s = "),
+        (SegmentType.STRING, r'"a\\"'),
+        (SegmentType.CODE, "; t = "),
+        (SegmentType.STRING, '"b"'),
+        (SegmentType.CODE, ";"),
+    ]
+    assert string_is_terminated(r'"a\\"')
+    assert not string_is_terminated(r'"a\\\"')  # `\\` then `\"`: the quote is escaped
+    assert string_is_terminated(r'"a\" something b"')  # `\"` stays inside, the last `"` closes
+    assert [t for k, t in scan(r'x = "a\" something b";') if k == SegmentType.STRING] == [r'"a\" something b"']
+
+
+def test_crlf_line_continuation() -> None:
+    # A `\` before a Windows line ending continues a line comment or string just like before `\n`.
+    comment_src = "// a \\\r\n b\r\nint x;"
+    assert scan(comment_src)[0] == (SegmentType.LINE_COMMENT, "// a \\\r\n b")
+    string_src = 's = "a \\\r\n b";\r\n'
+    assert [t for k, t in scan(string_src) if k == SegmentType.STRING] == ['"a \\\r\n b"']
+
+
+def test_unterminated_block_comment_runs_to_end() -> None:
+    # Unlike a string, a block comment may span lines, so there is no line end to stop at: an unclosed `/*` runs to
+    # the end of the input, as in C.
+    src = "x = 1; /* never closed\nreturn x;\n}"
+    segs = scan(src)
+    assert "".join(t for _, t in segs) == src
+    assert segs == [(SegmentType.CODE, "x = 1; "), (SegmentType.BLOCK_COMMENT, "/* never closed\nreturn x;\n}")]
+
+
 def test_unterminated_string_freezes_from_the_quote() -> None:
     # A truncated literal (no closing quote, e.g. a clipped Binary Ninja URL)
     # leaves the string open at the newline. Everything from the quote to the
@@ -56,7 +96,40 @@ def test_string_is_terminated() -> None:
     assert not string_is_terminated('"File: "%n" here;')  # embedded-quote freeze
     assert not string_is_terminated('"')  # lone quote
     assert not string_is_terminated("code")  # not a string at all
+    assert string_is_terminated('"a \\\nb"')  # `\`-newline continuation, closed on the next line
+    assert not string_is_terminated('"abc\\')  # trailing `\` escapes past the end
+    assert not string_is_terminated('"a\\"')  # the only closing quote is escaped
 
+
+def test_crlf_line_comment_keeps_line_ending() -> None:
+    # The `\r` of a `\r\n` belongs to the line ending, so stripping the comment keeps CRLF line endings intact.
+    assert scan("// c\r\nx;") == [(SegmentType.LINE_COMMENT, "// c"), (SegmentType.CODE, "\r\nx;")]
+    assert strip_comments("// c\r\nx;") == "\r\nx;"
+
+
+def test_slash_operators_are_not_comments() -> None:
+    assert scan("x = a / b; y /= c;") == [(SegmentType.CODE, "x = a / b; y /= c;")]
+
+
+def test_apostrophe_inside_string_is_not_a_char() -> None:
+    assert scan("""s = "it's"; c = 'a';""") == [
+        (SegmentType.CODE, "s = "),
+        (SegmentType.STRING, '"it\'s"'),
+        (SegmentType.CODE, "; c = "),
+        (SegmentType.CHAR, "'a'"),
+        (SegmentType.CODE, ";"),
+    ]
+
+
+def test_strip_comments_keep_warnings() -> None:
+    src = "/* WARNING: bad stack */ x; /* note */ y; // WARNING line\n"
+    assert strip_comments(src, keep_warnings=True) == "/* WARNING: bad stack */ x;   y; \n"
+    assert strip_comments(src) == "  x;   y; \n"
+
+
+def test_map_code_edits_only_code() -> None:
+    src = "a = \"a\"; // a\nb = 'a'; /* a */"
+    assert map_code(src, str.upper) == "A = \"a\"; // a\nB = 'a'; /* a */"
 
 def test_msvc_quoted_name() -> None:
     # MSVC C++ symbols contain a lone apostrophe (`vftable'`); it must NOT start a
@@ -83,11 +156,18 @@ def test_msvc_quoted_name_does_not_pair_with_later_char() -> None:
     assert (SegmentType.CHAR, "'A'") in segs
 
 
+def test_backtick_in_string_or_comment_does_not_hide_char() -> None:
+    # Regression: a backtick inside a string or block comment was taken as an open MSVC name, so the next char
+    # literal on the line was treated as code and its contents rewritten.
+    for src in ("s = \"`ls`\"; c = ' ';", "/* `x */ c = ' ';"):
+        assert (SegmentType.CHAR, "' '") in scan(src)
+        assert "' '" in transform(src + "\n", Tier.T1_COSMETIC)
+
+
 def test_line_comment_backslash_continuation() -> None:
     # A `//` comment ending in `\` continues onto the next line in C; that line
     # is comment, not code, so the scanner must not surface it as CODE.
     src = "a; // cont \\\nstill comment\nb;\n"
-    kinds = {kind for kind, _ in scan(src)}
     assert "".join(t for _, t in scan(src)) == src  # roundtrip preserved
     assert "still comment" not in strip_comments(src)
 
@@ -124,6 +204,31 @@ def test_unterminated_string_freeze_is_line_local() -> None:
     assert "data_40c0" not in out  # ...and by compress-names (no cascade)
 
 
+def test_unterminated_string_freeze_swallows_earlier_segments_on_its_line() -> None:
+    # Before reaching the unclosed `"c`, scan has already emitted the segments of this line:
+    #   CODE 'x = ', STRING '"a"', CODE ' + ', CHAR "'b'"   (and ' + ' is pending code)
+    # The freeze moves back to the line's first string `"a"`, pops everything emitted from there on, and emits the
+    # whole rest of the line as one STRING. Only the code before the first string survives.
+    src = "x = \"a\" + 'b' + \"c\ny;"
+    assert scan(src) == [
+        (SegmentType.CODE, "x = "),
+        (SegmentType.STRING, "\"a\" + 'b' + \"c"),
+        (SegmentType.CODE, "\ny;"),
+    ]
+
+
+def test_unterminated_string_freeze_ignores_strings_on_earlier_lines() -> None:
+    # Only a closed string on the *same* line moves the freeze start back; `"ok"` on the line before stays intact.
+    src = 'a = "ok";\nb = "broken\nc;'
+    assert scan(src) == [
+        (SegmentType.CODE, "a = "),
+        (SegmentType.STRING, '"ok"'),
+        (SegmentType.CODE, ";\nb = "),
+        (SegmentType.STRING, '"broken'),
+        (SegmentType.CODE, "\nc;"),
+    ]
+
+
 def test_genuine_multiline_string_concatenation_not_split() -> None:
     # Adjacent string-literal concatenation across lines is valid C: each literal
     # is closed on its own line, so none is "open" at a break and nothing freezes.
@@ -158,20 +263,39 @@ def test_asm_substring_in_identifier_not_matched() -> None:
     assert not any(k == SegmentType.ASM for k, _ in scan("x = __asm + 1;"))
 
 
-def test_protected_line_edges_marks_asm_interior() -> None:
+def test_unterminated_asm_block_runs_to_end() -> None:
+    src = "x;\n__asm {\n  nop\ny;"
+    assert scan(src) == [(SegmentType.CODE, "x;\n"), (SegmentType.ASM, "__asm {\n  nop\ny;")]
+
+
+def test_protected_line_ends_marks_asm_interior() -> None:
     # An `__asm { ... }` block is a frozen opaque region, so its interior lines
     # must report as protected (like a multi-line string) --- otherwise the
     # line-oriented cosmetic passes would de-indent its assembly operands.
     src = "x = 1;\n__asm\n{\n  vmovdqa xmm7, foo\n}\ny = 2;\n"
-    edges = protected_line_edges(src)
+    edges = protected_line_ends(src)
     lines = src.split("\n")
     assert lines[0] == "x = 1;" and edges[0] == (False, False)  # plain code
     assert lines[3] == "  vmovdqa xmm7, foo" and edges[3] == (True, True)  # asm interior
 
 
+def test_protected_line_ends_start_and_end_differ() -> None:
+    # A string continued with `\`-newline opens at the end of one line and closes at the start of the next.
+    assert protected_line_ends('x = "a \\\nb";') == [(False, True), (True, False)]
+    # A char literal at a line edge protects that edge only.
+    assert protected_line_ends("'a' + b") == [(True, False)]
+
+
+def test_protected_line_ends_empty_lines() -> None:
+    # An empty line inside an `__asm` block is protected, an empty line in plain code is not.
+    edges = protected_line_ends("__asm {\n\n  nop }\n\nx;")
+    assert edges[1] == (True, True)
+    assert edges[3] == (False, False)
+
+
 def test_t1_preserves_asm_block_interior() -> None:
     # Regression: the line-oriented T1 passes (ws-indent/-trailing/-blanklines)
-    # once de-indented `__asm` interiors because `protected_line_edges` only
+    # once de-indented `__asm` interiors because `protected_line_ends` only
     # guarded string/char literals. The assembly text must survive T1 verbatim.
     src = "void f(){\n  __asm\n    {\n      vmovdqa xmm7, cs:foo\n    }\n  x = 1;\n}\n"
     out = transform(src, Tier.T1_COSMETIC)

@@ -30,17 +30,24 @@ class CToken(NamedTuple):
     start: int
     end: int
 
+
 # A whole C numeric literal: hex float (`0x1.8p3`), hex integer, or decimal integer/float (`1e-3`, `.5`), each with any
 # trailing suffix (`u`, `ULL`, `f`, Hex-Rays' `i64`). An exponent sign is taken only right after `e`/`E` (decimal) or
 # `p`/`P` (hex float), so `0x1e+3` stays `0x1e` `+` `3`.
-CNUMBER = re.compile(r"0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)[pP][+-]?\d+\w*" r"|0[xX][0-9a-fA-F]+\w*" r"|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\w*")
+CNUMBER = re.compile(
+    r"0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)[pP][+-]?\d+\w*"
+    r"|0[xX][0-9a-fA-F]+\w*"
+    r"|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\w*"
+)
 
 # An integer literal with an optional integer suffix; group 1 is the digits (with any `0x` prefix), group 2 the suffix.
 CINT = re.compile(r"(0[xX][0-9a-fA-F]+|\d+)([uUlL]*|[uU]?i(?:8|16|32|64))")
 
 # A single C token: multi-char operators first (so they are not split), then identifiers, numeric literals, and finally
 # any single non-space character.
-CTOKEN = re.compile(r"<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=" r"|[A-Za-z_]\w*" rf"|{CNUMBER.pattern}" r"|\S")
+CTOKEN = re.compile(
+    r"<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=" r"|[A-Za-z_]\w*" rf"|{CNUMBER.pattern}" r"|\S"
+)
 
 
 def ctokenize(code: str) -> List[CToken]:
@@ -184,10 +191,9 @@ def word_before(code_chars: List[str], end_idx: int) -> str:
     `code_chars` is the code as single characters with whitespace removed and strings/comments skipped, so a caller can
     ask which word precedes a `{` or `(` at `end_idx`: for `} else {` the word before the `{` is `else`.
     Because there is no whitespace, adjacent words read back glued together (`else if (` gives `elseif`, `struct foo {`
-    gives `structfoo`).
-    Only ASCII letters, digits, and `_` (`WORD_CHARS`) form a word. Returns `""` if `end_idx` is 0, the character before
-    it is not a word character, or the run starts with a digit (the tail of a number such as `1` or `0x1F`, never a
-    valid identifier).
+    gives `structfoo`). Only ASCII letters, digits, and `_` (`WORD_CHARS`) form a word.
+    Returns `""` if `end_idx` is 0, the character before it is not a word character, or the run starts with a digit
+    (the tail of a number such as `1` or `0x1F`, never a valid identifier).
     """
     word = ""
     idx = end_idx - 1

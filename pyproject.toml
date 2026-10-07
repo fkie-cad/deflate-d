@@ -16,10 +16,19 @@ dependencies = []
 test = ["pytest"]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "black", "isort"]
 
 [project.scripts]
 deflate-d = "deflated.reformat:main"
+
+[tool.black]
+line-length = 140
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+src_paths = ["deflated"]
+line_length = 140
 
 [tool.pytest.ini_options]
 testpaths = ["deflated/tests"]
