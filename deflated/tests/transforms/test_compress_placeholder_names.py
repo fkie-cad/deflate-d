@@ -134,6 +134,7 @@ class TestCompressPlaceholderNames:
         assert "LAB_00401234" not in out
         # The goto target and the label definition must be the same token.
         import re
+
         gotos = re.findall(r"goto\s+(\w+)", out)
         labels = re.findall(r"(\w+)\s*:", out)
         assert gotos and labels and gotos[0] in labels
@@ -338,7 +339,7 @@ class TestCompressPlaceholderNames:
         c = CompressPlaceholderNames()
         out = c.apply("struct S { int result; }; int g(struct S *s){ int result; result = s->result; return result; }")
         assert "struct S { int result; }" in out  # field declaration preserved
-        assert "s->result" in out                  # member access preserved
+        assert "s->result" in out  # member access preserved
         assert "int result;" not in out.split("}", 1)[1]  # the standalone local was renamed
 
     def test_enum_constants_renamed_consistently_def_and_use(self) -> None:

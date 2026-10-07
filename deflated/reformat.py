@@ -77,7 +77,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-t",
         default="T3",
         help="target tier: T1/T2/T3/T4 or 1-4 (default: T3, the most aggressive tier that only "
-             "discards decompiler bookkeeping; T4 also strips genuine analyst signal such as ABI keywords)",
+        "discards decompiler bookkeeping; T4 also strips genuine analyst signal such as ABI keywords)",
     )
     parser.add_argument("--exclude", default="", metavar="ID[,ID...]", help="comma-separated transform ids to skip")
     parser.add_argument("--list", action="store_true", help="list transform ids per tier and exit")

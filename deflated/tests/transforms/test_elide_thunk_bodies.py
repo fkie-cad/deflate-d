@@ -64,11 +64,7 @@ class TestElideThunkBodies:
         assert ElideThunkBodies().apply(src) == src
 
     def test_multiple_thunks_and_a_real_function(self) -> None:
-        src = (
-            "void free(void *p){(*PTR_free_1)();return;}"
-            "int real(int x){int y;y=x*x;return y;}"
-            "void abort(void){abort();}"
-        )
+        src = "void free(void *p){(*PTR_free_1)();return;}" "int real(int x){int y;y=x*x;return y;}" "void abort(void){abort();}"
         out = ElideThunkBodies().apply(src)
         assert "void free(void *p);" in out
         assert "void abort(void);" in out
@@ -83,10 +79,7 @@ class TestElideThunkBodies:
         # A family (>= 2) of *pure passthrough* trampolines -- the forwarded
         # arguments are exactly the parameters, verbatim and in order -- carries
         # nothing beyond "calls worker", so the family collapses to prototypes.
-        src = (
-            "i64 ht(i32 *a, i64 c){return gv(a, c);}"
-            "i64 hu(i32 *a, i64 c){return gv(a, c);}"
-        )
+        src = "i64 ht(i32 *a, i64 c){return gv(a, c);}" "i64 hu(i32 *a, i64 c){return gv(a, c);}"
         out = ElideThunkBodies().apply(src)
         assert "i64 ht(i32 *a, i64 c);" in out
         assert "i64 hu(i32 *a, i64 c);" in out
@@ -96,10 +89,7 @@ class TestElideThunkBodies:
         # are NOT pure passthroughs -- the constant distinguishes them (e.g. two
         # argument parsers differing only in the numeric base), so the bodies are
         # real code and must survive even though >= 2 share the worker.
-        src = (
-            "i64 ht(i32 *a, i64 c){return gv(a, c, 0);}"
-            "i64 hu(i32 *a, i64 c){return gv(a, c, 2);}"
-        )
+        src = "i64 ht(i32 *a, i64 c){return gv(a, c, 0);}" "i64 hu(i32 *a, i64 c){return gv(a, c, 2);}"
         assert ElideThunkBodies().apply(src) == src
 
     def test_reordered_comparator_family_kept(self) -> None:
@@ -107,10 +97,7 @@ class TestElideThunkBodies:
         # comparators forward the SAME worker but reorder/deref the parameters, so
         # the argument order is the semantics. They must not collapse to identical
         # prototypes (which would erase the sort direction).
-        src = (
-            "int fwd(char **a1, char **a2){return strcmp(*a1, *a2);}"
-            "int rev(char **a1, char **a2){return strcmp(*a2, *a1);}"
-        )
+        src = "int fwd(char **a1, char **a2){return strcmp(*a1, *a2);}" "int rev(char **a1, char **a2){return strcmp(*a2, *a1);}"
         assert ElideThunkBodies().apply(src) == src
 
     def test_lone_forwarder_kept(self) -> None:

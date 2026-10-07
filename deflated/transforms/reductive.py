@@ -354,20 +354,84 @@ class StripChkSuffix(Transform):
     _FORTIFY_BASES = frozenset(
         {
             # stdio / printf family
-            "printf", "fprintf", "dprintf", "sprintf", "snprintf", "asprintf", "obstack_printf",
-            "vprintf", "vfprintf", "vdprintf", "vsprintf", "vsnprintf", "vasprintf", "obstack_vprintf",
-            "fwprintf", "wprintf", "swprintf", "vfwprintf", "vwprintf", "vswprintf",
+            "printf",
+            "fprintf",
+            "dprintf",
+            "sprintf",
+            "snprintf",
+            "asprintf",
+            "obstack_printf",
+            "vprintf",
+            "vfprintf",
+            "vdprintf",
+            "vsprintf",
+            "vsnprintf",
+            "vasprintf",
+            "obstack_vprintf",
+            "fwprintf",
+            "wprintf",
+            "swprintf",
+            "vfwprintf",
+            "vwprintf",
+            "vswprintf",
             # mem / str
-            "memcpy", "memmove", "mempcpy", "memset", "bcopy", "bzero", "explicit_bzero",
-            "stpcpy", "stpncpy", "strcat", "strcpy", "strncat", "strncpy",
-            "wmemcpy", "wmemmove", "wmempcpy", "wmemset", "wcscpy", "wcpcpy", "wcscat", "wcsncat", "wcsncpy", "wcpncpy",
+            "memcpy",
+            "memmove",
+            "mempcpy",
+            "memset",
+            "bcopy",
+            "bzero",
+            "explicit_bzero",
+            "stpcpy",
+            "stpncpy",
+            "strcat",
+            "strcpy",
+            "strncat",
+            "strncpy",
+            "wmemcpy",
+            "wmemmove",
+            "wmempcpy",
+            "wmemset",
+            "wcscpy",
+            "wcpcpy",
+            "wcscat",
+            "wcsncat",
+            "wcsncpy",
+            "wcpncpy",
             # io / system
-            "gets", "fgets", "fgets_unlocked", "fread", "fread_unlocked",
-            "getcwd", "getwd", "getdomainname", "getgroups", "gethostname", "getlogin_r",
-            "pread", "pread64", "read", "readlink", "readlinkat", "realpath",
-            "recv", "recvfrom", "ttyname_r", "ptsname_r", "confstr", "poll", "ppoll",
-            "wctomb", "mbstowcs", "wcstombs", "mbsrtowcs", "wcsrtombs", "mbsnrtowcs", "wcsnrtombs",
-            "syslog", "vsyslog",
+            "gets",
+            "fgets",
+            "fgets_unlocked",
+            "fread",
+            "fread_unlocked",
+            "getcwd",
+            "getwd",
+            "getdomainname",
+            "getgroups",
+            "gethostname",
+            "getlogin_r",
+            "pread",
+            "pread64",
+            "read",
+            "readlink",
+            "readlinkat",
+            "realpath",
+            "recv",
+            "recvfrom",
+            "ttyname_r",
+            "ptsname_r",
+            "confstr",
+            "poll",
+            "ppoll",
+            "wctomb",
+            "mbstowcs",
+            "wcstombs",
+            "mbsrtowcs",
+            "wcsrtombs",
+            "mbsnrtowcs",
+            "wcsnrtombs",
+            "syslog",
+            "vsyslog",
         }
     )
 
@@ -839,7 +903,14 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
             continue
         # A `(` immediately followed by `*` is a declarator grouping wrapping the
         # real name (`(**init_proc())`), not this token's parameter list.
-        if depth == 0 and _IDENT.fullmatch(t) and t not in _RESERVED and i + 1 < n and toks[i + 1][0] == "(" and (i + 2 >= n or toks[i + 2][0] != "*"):
+        if (
+            depth == 0
+            and _IDENT.fullmatch(t)
+            and t not in _RESERVED
+            and i + 1 < n
+            and toks[i + 1][0] == "("
+            and (i + 2 >= n or toks[i + 2][0] != "*")
+        ):
             close = _match_delim(toks, i + 1)
             if close is not None:
                 bo = _body_open_after(toks, close, n)
@@ -1005,7 +1076,11 @@ class DropCrtFunctions(Transform):
 
     def apply(self, code: str) -> str:
         toks = _tok_offsets(code)
-        candidates = [(name, ss, bce) for name, ss, bo, bc, bce in _top_level_functions(toks) if name in self._CRT_NAMES or (name == "entry" and self._is_entry_trampoline(toks, bo, bc))]
+        candidates = [
+            (name, ss, bce)
+            for name, ss, bo, bc, bce in _top_level_functions(toks)
+            if name in self._CRT_NAMES or (name == "entry" and self._is_entry_trampoline(toks, bo, bc))
+        ]
         if not candidates:
             return code
 

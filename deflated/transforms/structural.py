@@ -59,17 +59,32 @@ def _strip_leading_labels(s: str) -> str:
     """Return ``s`` with any leading goto-labels removed (see _split_leading_labels)."""
     return _split_leading_labels(s)[1]
 
+
 # C binary-operator precedence (smaller binds tighter). Used to verify that
 # folding `a = a OP rest` -> `a OP= rest` does not silently re-group the
 # right-hand side (which would change the result for non-associative OPs).
 _PRECEDENCE = {
-    "*": 3, "/": 3, "%": 3,
-    "+": 4, "-": 4,
-    "<<": 5, ">>": 5,
-    "<": 6, "<=": 6, ">": 6, ">=": 6,
-    "==": 7, "!=": 7,
-    "&": 8, "^": 9, "|": 10, "&&": 11, "||": 12,
-    "?": 13, ":": 13, ",": 14,
+    "*": 3,
+    "/": 3,
+    "%": 3,
+    "+": 4,
+    "-": 4,
+    "<<": 5,
+    ">>": 5,
+    "<": 6,
+    "<=": 6,
+    ">": 6,
+    ">=": 6,
+    "==": 7,
+    "!=": 7,
+    "&": 8,
+    "^": 9,
+    "|": 10,
+    "&&": 11,
+    "||": 12,
+    "?": 13,
+    ":": 13,
+    ",": 14,
 }
 # OPs whose repeated application is associative *for every operand type they
 # accept*, so a same-precedence chain `a OP b OP c` may still fold. Only the
@@ -803,7 +818,14 @@ class CanonicalizeControlFlow(Transform):
     _LABEL_REF = re.compile(r"\bgoto\s+([A-Za-z_]\w*)|&&\s*([A-Za-z_]\w*)")
 
     def _drop_unreferenced_labels(self, code: str) -> str:
-        referenced = {g for seg_type, text in scan(code) if seg_type == SegmentType.CODE for m in self._LABEL_REF.finditer(text) for g in m.groups() if g}
+        referenced = {
+            g
+            for seg_type, text in scan(code)
+            if seg_type == SegmentType.CODE
+            for m in self._LABEL_REF.finditer(text)
+            for g in m.groups()
+            if g
+        }
         out: list[str] = []
         for piece in _split_statements(code):
             ml = self._LABEL.match(piece)
@@ -960,7 +982,9 @@ class DerefOffsetToIndex(Transform):
                 # rewrite, so the wider form is the lossless direction. A float
                 # left operand (``1.5 * (a + 4)``) is still a value, and reading
                 # its ``*`` as a deref would corrupt the multiply.
-                is_value = prev is not None and (prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT_RX.match(prev) and prev not in _NONVALUE_KW))
+                is_value = prev is not None and (
+                    prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT_RX.match(prev) and prev not in _NONVALUE_KW)
+                )
                 if not is_value:
                     close = _match_delim(toks, i + 1)
                     if close is not None:
@@ -980,7 +1004,14 @@ class DerefOffsetToIndex(Transform):
         """Return ``base[off]`` for an inner ``IDENT + NUM`` / ``& IDENT + NUM``."""
         if len(inner) == 3 and _IDENT_RX.match(inner[0]) and inner[0] not in _NONVALUE_KW and inner[1] == "+" and CINT.fullmatch(inner[2]):
             return f"{inner[0]}[{inner[2]}]"
-        if len(inner) == 4 and inner[0] == "&" and _IDENT_RX.match(inner[1]) and inner[1] not in _NONVALUE_KW and inner[2] == "+" and CINT.fullmatch(inner[3]):
+        if (
+            len(inner) == 4
+            and inner[0] == "&"
+            and _IDENT_RX.match(inner[1])
+            and inner[1] not in _NONVALUE_KW
+            and inner[2] == "+"
+            and CINT.fullmatch(inner[3])
+        ):
             return f"(&{inner[1]})[{inner[3]}]"
         return None
 
@@ -1016,7 +1047,13 @@ class DropTrailingReturn(Transform):
                 # ... unless the `return` is the sole statement of a label
                 # (`done: return; }`): dropping it would leave `done: }`, a label
                 # with no statement (invalid C before C23), so keep it.
-                if depth == 0 and j >= 2 and toks[j - 1][0] == ";" and toks[j - 2][0] == "return" and not (j >= 3 and toks[j - 3][0] == ":"):
+                if (
+                    depth == 0
+                    and j >= 2
+                    and toks[j - 1][0] == ";"
+                    and toks[j - 2][0] == "return"
+                    and not (j >= 3 and toks[j - 3][0] == ":")
+                ):
                     edits.append((toks[j - 2][1], toks[j - 1][2]))
         for lo, hi in reversed(edits):
             code = code[:lo] + code[hi:]

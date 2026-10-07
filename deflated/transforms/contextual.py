@@ -221,7 +221,9 @@ class CompressFunctionNames(Transform):
         mapping = {name: next(gen) for name in targets}
 
         big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
-        return "".join((big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments)
+        return "".join(
+            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments
+        )
 
     def _all_placeholder_funcs(self, segments: list[tuple[str, str]]) -> list[str]:
         """Every placeholder function name anywhere (def, prototype, or call)."""
@@ -613,7 +615,9 @@ class DropNullPointerCast(Transform):
     # Keywords that, before a `(`, make it a *grouping* paren rather than a call:
     # `return ((T *)0x0)` is a group, `f((T *)0x0)` is a call. Used to tell the two
     # apart when the cast+null is wrapped in its own parens (see apply()).
-    _GROUPING_BEFORE = frozenset({"return", "sizeof", "if", "while", "for", "switch", "case", "do", "else", "goto", "_Alignof", "alignof", "typeof"})
+    _GROUPING_BEFORE = frozenset(
+        {"return", "sizeof", "if", "while", "for", "switch", "case", "do", "else", "goto", "_Alignof", "alignof", "typeof"}
+    )
     # Tokens that may follow the null literal without the int/pointer distinction mattering.
     _SAFE_AFTER = frozenset({")", ";", ",", "]", "}", ":", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "?"})
     # The null constant in either spelling. ``int-minform`` (T2) re-spells ``0x0``
@@ -734,7 +738,9 @@ class AddressOfIndexToOffset(Transform):
                 # `&` is binary (bitwise-and) only after a value: a non-keyword
                 # identifier, a number, or a closing `)`/`]`. After a keyword
                 # (`return`), an operator, or `(`/`,`/`;` it is unary address-of.
-                is_value = prev is not None and (prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT.fullmatch(prev) and prev not in _RESERVED))
+                is_value = prev is not None and (
+                    prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT.fullmatch(prev) and prev not in _RESERVED)
+                )
                 unary = not is_value
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
                 # ``CINT``, not ``CNUMBER``: a match here *performs* the rewrite,
@@ -790,7 +796,9 @@ class StripPointerSlotAddress(Transform):
         if not mapping:
             return code
         big = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in mapping) + r")\b")
-        return "".join((big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments)
+        return "".join(
+            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments
+        )
 
 
 class TrimPieceAccessSuffix(Transform):

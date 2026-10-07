@@ -13,8 +13,7 @@ class TestDropTrailingReturn:
         [
             ("void f(void){g();return;}", "void f(void){g();}"),
             ("void f(void){return;}", "void f(void){}"),
-            ("void f(int x){h(x);return;}\nvoid g(void){k();return;}",
-             "void f(int x){h(x);}\nvoid g(void){k();}"),
+            ("void f(int x){h(x);return;}\nvoid g(void){k();return;}", "void f(int x){h(x);}\nvoid g(void){k();}"),
         ],
     )
     def test_rewritten(self, src, expected) -> None:

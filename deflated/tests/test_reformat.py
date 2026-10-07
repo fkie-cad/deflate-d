@@ -9,7 +9,6 @@ import pytest
 
 from deflated.reformat import build_arg_parser, main
 
-
 # --- build_arg_parser() ---
 
 

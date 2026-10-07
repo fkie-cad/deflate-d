@@ -81,10 +81,7 @@ class TestJoinLines:
         assert c.apply(r'printf("line1\n \" line2");' + "\nreturn 0;") == r'printf("line1\n \" line2");' + " return 0;"
         # Blank lines (\n\n) and indentation escapes between the quotes are part of
         # the string and survive verbatim; only the trailing line break collapses.
-        assert (
-            c.apply(r'printf("line1\n\n        line2");' + "\nreturn 0;")
-            == r'printf("line1\n\n        line2");' + " return 0;"
-        )
+        assert c.apply(r'printf("line1\n\n        line2");' + "\nreturn 0;") == r'printf("line1\n\n        line2");' + " return 0;"
 
     def test_unterminated_string_keeps_its_newline(self) -> None:
         # A frozen (unterminated) literal must be ISOLATED on its own physical line:

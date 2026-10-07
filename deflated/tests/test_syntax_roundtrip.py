@@ -44,9 +44,7 @@ from deflated.transforms import build_pipeline
 
 # A compiler is optional tooling, not a dependency of the package, so the whole
 # module stands down rather than failing where gcc is absent.
-pytestmark = pytest.mark.skipif(
-    shutil.which("gcc") is None, reason="gcc not available; cannot syntax-check output"
-)
+pytestmark = pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc not available; cannot syntax-check output")
 
 SAMPLES = Path(__file__).parent / "samples"
 EXAMPLES = Path(__file__).parent.parent / "examples"
@@ -123,26 +121,20 @@ CORPUS: list[Path] = [
 # them the round-trip test would compile four tidy samples and prove very little.
 CONTROL_FLOW_SNIPPETS: dict[str, str] = {
     "return_in_if": 'void f(int c)\n\n{\n  puts("x");\n  if (c != 0) {\n    return;\n  }\n}\n',
-    "return_in_else": (
-        'void f(int c)\n\n{\n  if (c != 0) {\n    puts("a");\n  }\n  else {\n    return;\n  }\n}\n'
-    ),
+    "return_in_else": ('void f(int c)\n\n{\n  if (c != 0) {\n    puts("a");\n  }\n  else {\n    return;\n  }\n}\n'),
     "return_in_while": "void f(int c)\n\n{\n  while (c != 0) {\n    c = c + -1;\n    return;\n  }\n}\n",
     "for_loop": (
-        "void f(int c)\n\n{\n  int iVar1;\n"
-        '  for (iVar1 = 0; iVar1 < c; iVar1 = iVar1 + 1) {\n    puts("y");\n  }\n  return;\n}\n'
+        "void f(int c)\n\n{\n  int iVar1;\n" '  for (iVar1 = 0; iVar1 < c; iVar1 = iVar1 + 1) {\n    puts("y");\n  }\n  return;\n}\n'
     ),
     "do_while": "void f(int c)\n\n{\n  do {\n    c = c + -1;\n  } while (c != 0);\n  return;\n}\n",
     "switch": (
-        "void f(int c)\n\n{\n  switch(c) {\n"
-        '  case 1:\n    puts("a");\n    break;\n  default:\n    puts("b");\n  }\n  return;\n}\n'
+        "void f(int c)\n\n{\n  switch(c) {\n" '  case 1:\n    puts("a");\n    break;\n  default:\n    puts("b");\n  }\n  return;\n}\n'
     ),
     "if_else_assign": (
         "undefined4 f(int c)\n\n{\n  undefined4 uVar1;\n"
         "  if (c != 0) {\n    uVar1 = 1;\n  }\n  else {\n    uVar1 = 2;\n  }\n  return uVar1;\n}\n"
     ),
-    "goto_label": (
-        'void f(int c)\n\n{\n  if (c != 0) goto LAB_1;\n  puts("a");\nLAB_1:\n  return;\n}\n'
-    ),
+    "goto_label": ('void f(int c)\n\n{\n  if (c != 0) goto LAB_1;\n  puts("a");\nLAB_1:\n  return;\n}\n'),
     # CODE_REVIEW 1.8: `0xFE-1` lexes as one invalid number. Only T1 can fail, since `int-minform` rewrites `0xFE` at T2.
     "hex_e_constant": "uint f(uint c)\n\n{\n  return c + 0xFE - 1;\n}\n",
 }
@@ -191,10 +183,7 @@ def test_raw_corpus_split_is_as_documented(path: Path, tmp_path: Path) -> None:
     # failure mode impossible to miss.
     ok, stderr = syntax_check(path.read_text(encoding="utf-8"), tmp_path)
     if path.name in RAW_UNCOMPILABLE:
-        assert not ok, (
-            f"{path.name} now compiles raw; drop it from RAW_UNCOMPILABLE "
-            f"(recorded reason: {RAW_UNCOMPILABLE[path.name]})"
-        )
+        assert not ok, f"{path.name} now compiles raw; drop it from RAW_UNCOMPILABLE " f"(recorded reason: {RAW_UNCOMPILABLE[path.name]})"
     else:
         assert ok, f"{path.name} no longer compiles raw --- the prelude is incomplete:\n{stderr}"
 

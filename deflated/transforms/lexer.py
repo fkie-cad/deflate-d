@@ -167,9 +167,7 @@ def lines_with_protection(code: str) -> List[Tuple[str, bool, bool]]:
     line_start = 0
     for line in code.split("\n"):
         if line:
-            protected_ends.append(
-                (line, bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1]))
-            )
+            protected_ends.append((line, bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1])))
         else:
             inside_protected_area = bool(protected_mask[line_start]) if line_start < len(code) else False
             protected_ends.append((line, inside_protected_area, inside_protected_area))

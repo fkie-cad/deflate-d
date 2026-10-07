@@ -44,12 +44,7 @@ class TestTierT1:
         # A string's interior --- its \n escapes and the spaces around them --- is
         # content, not code layout, so the line-oriented cosmetic passes
         # (indent/trailing/blanklines) must pass it through untouched.
-        src = (
-            "int f(void){\n"
-            r'  puts("line1\n    line2\n\n    line3");' "\n"
-            "  return 0;\n"
-            "}\n"
-        )
+        src = "int f(void){\n" r'  puts("line1\n    line2\n\n    line3");' "\n" "  return 0;\n" "}\n"
         assert r'"line1\n    line2\n\n    line3"' in transform(src, Tier.T1_COSMETIC)
 
     def test_preprocessor_directive_preserved(self) -> None:

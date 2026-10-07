@@ -9,12 +9,7 @@ class TestEraseResolverStubs:
     def test_family_deleted_resolver_kept(self) -> None:
         # The post-T3 Binary Ninja shape: a shared resolver `a` plus per-slot
         # stubs that load a constant and tail-call it.
-        src = (
-            "i64 a(){i64 er=es;}"
-            "i64 b(){i64 er=0;return a();}"
-            "i64 e(){i64 er=1;return a();}"
-            "i64 f(){i64 er=2;return a();}"
-        )
+        src = "i64 a(){i64 er=es;}" "i64 b(){i64 er=0;return a();}" "i64 e(){i64 er=1;return a();}" "i64 f(){i64 er=2;return a();}"
         out = EraseResolverStubs().apply(src)
         assert "i64 a(){i64 er=es;}" in out  # resolver kept
         for stub in ("i64 b()", "i64 e()", "i64 f()"):
@@ -33,12 +28,7 @@ class TestEraseResolverStubs:
     def test_referenced_stub_kept(self) -> None:
         # A stub whose name is referenced elsewhere is not deleted (its name
         # occurs more than once), even if its shape matches the family.
-        src = (
-            "i64 b(){i64 er=0;return a();}"
-            "i64 e(){i64 er=1;return a();}"
-            "i64 f(){i64 er=2;return a();}"
-            "int main(){return b();}"
-        )
+        src = "i64 b(){i64 er=0;return a();}" "i64 e(){i64 er=1;return a();}" "i64 f(){i64 er=2;return a();}" "int main(){return b();}"
         out = EraseResolverStubs().apply(src)
         assert "i64 b()" in out  # referenced -> kept
         assert "i64 e()" not in out and "i64 f()" not in out
