@@ -18,6 +18,19 @@ class TestTightenCommentSpaces:
         t = TightenCommentSpaces()
         assert t.apply("//\tsome comment") == "//some comment"
 
+    @pytest.mark.parametrize(
+        "src, expected",
+        [
+            ("a; // x \\\n\nb;", "a; //x \\\n\nb;"),  # blank line after the continuation
+            ("a; // x \\\n", "a; //x \\\n"),  # continuation at end of input
+            ("a; // x \\\r\n\r\nb;", "a; //x \\\r\n\r\nb;"),  # CRLF
+        ],
+    )
+    def test_newline_after_continuation_kept(self, src, expected) -> None:
+        # The newline after a trailing `\` belongs to the comment; stripping it
+        # would pull the next line into the comment.
+        assert TightenCommentSpaces().apply(src) == expected
+
     def test_internal_spaces_collapsed(self) -> None:
         t = TightenCommentSpaces()
         assert t.apply("// some   comment") == "//some comment"

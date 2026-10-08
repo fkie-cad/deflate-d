@@ -178,21 +178,21 @@ class TightenCommentSpaces(Transform):
     description = "Strip and collapse whitespace inside comments."
 
     def apply(self, code: str) -> str:
-        out: List[str] = []
+        transformed_code: str = ""
         for seg_type, text in scan(code):
             if seg_type == SegmentType.LINE_COMMENT:
-                interior = _BLANKS.sub(" ", text[2:]).strip()
-                out.append("//" + interior)
+                interior = _BLANKS.sub(" ", text[2:]).strip(" \t")
+                transformed_code += "//" + interior
             elif seg_type == SegmentType.BLOCK_COMMENT:
-                # An unterminated `/* ...` (run to EOF by the lexer) has no closer
-                # to strip or re-append: keep the interior but don't fabricate `*/`.
-                is_closed = text.endswith("*/")
+                # An unterminated `/* ...` (run to EOF by the lexer) has no closer to strip or re-append:
+                # keep the interior but don't fabricate `*/`. Note, `/*/` opens a comment, but does not close it.
+                is_closed = text != "/*/" and text.endswith("*/")
                 interior = text[2:-2] if is_closed else text[2:]
                 interior = _BLANKS.sub(" ", interior).strip(" \t")
-                out.append("/*" + interior + ("*/" if is_closed else ""))
+                transformed_code += "/*" + interior + ("*/" if is_closed else "")
             else:
-                out.append(text)
-        return "".join(out)
+                transformed_code += text
+        return transformed_code
 
 
 class TightenWhitespace(Transform):
