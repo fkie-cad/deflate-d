@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from typing import List
+
+import pytest
+
 from deflated import Tier, transform
 from deflated.transforms.lexer import (
+    Segment,
     SegmentType,
     map_code,
     lines_with_protection,
     scan,
+    split_directives,
     string_is_terminated,
     strip_comments,
 )
@@ -315,3 +321,200 @@ def test_t1_keeps_do_keyword_off_asm_block() -> None:
     assert len(asm) == 1 and "nop" in asm[0]
     # And the whole thing is idempotent under T2.
     assert transform(out, Tier.T2_STRUCTURAL) == out
+
+
+# --- encoding prefixes (`L"..."`, `u8'a'`): part of the literal, not code ---
+
+
+@pytest.mark.parametrize("prefix", ["L", "u", "U", "u8"])
+def test_literal_prefix_belongs_to_the_literal(prefix: str) -> None:
+    # `L"text"` is one token, a wide string. Split into CODE `L` and STRING `"text"`, a pass may put a space between.
+    assert scan(f'x = {prefix}"text";') == [
+        (SegmentType.CODE, "x = "),
+        (SegmentType.STRING, f'{prefix}"text"'),
+        (SegmentType.CODE, ";"),
+    ]
+    assert scan(f"c = {prefix}'a';") == [
+        (SegmentType.CODE, "c = "),
+        (SegmentType.CHAR, f"{prefix}'a'"),
+        (SegmentType.CODE, ";"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("src", "string"),
+    [
+        ('x = myL"a";', '"a"'),  # `myL` is an identifier, not a prefix
+        ('x = xu8"a";', '"a"'),
+        ('x = 1L"a";', '"a"'),  # `1L` is a number
+        ('x = L "a";', '"a"'),  # a space between: identifier `L`, then a plain string
+        ('x = L\n"a";', '"a"'),  # a newline between: the same
+    ],
+)
+def test_literal_prefix_only_as_whole_word_before_the_quote(src: str, string: str) -> None:
+    assert [t for k, t in scan(src) if k == SegmentType.STRING] == [string]
+
+
+def test_prefixed_string_is_terminated() -> None:
+    assert string_is_terminated('L"text"')
+    assert string_is_terminated('u8"text"')
+    assert not string_is_terminated('L"trunc')
+
+
+def test_unterminated_prefixed_string_freezes_from_the_prefix() -> None:
+    assert scan('x = L"trunc\ny;') == [
+        (SegmentType.CODE, "x = "),
+        (SegmentType.STRING, 'L"trunc'),
+        (SegmentType.CODE, "\ny;"),
+    ]
+    # The freeze moves back to the line's first string, prefix included.
+    assert scan('x = L"a" + "c\ny;') == [
+        (SegmentType.CODE, "x = "),
+        (SegmentType.STRING, 'L"a" + "c'),
+        (SegmentType.CODE, "\ny;"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        # CODE_REVIEW 1.18: was `wcscpy(buf,L "text");`, which gcc rejects (`'L' undeclared`).
+        ('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'),
+        ("c = u8'a';", "c=u8'a';"),
+    ],
+)
+def test_prefixed_literal_unchanged_under_t1(src: str, expected: str) -> None:
+    assert transform(src, Tier.T1_COSMETIC) == expected
+
+
+# --- preprocessor directives (`split_directives`) ---
+
+CODE, DIRECTIVE = SegmentType.CODE, SegmentType.DIRECTIVE
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "",
+        "#define A 1",
+        "x;\n#define A 1\ny;",
+        '#include "a.h"\n#include <b.h>\n',
+        "#define A \\\n  1 /* c\nd */ 'x' \"s\" // e\ny;",
+        "x; /* a\nb */ #a\ny;",
+        '"s" #x\n',
+        "x;\n\t /* a */ /* b */ #a\n",
+        "__asm { }\n#a\n",
+        '#define A "x\ny;',
+    ],
+)
+def test_split_directives_roundtrip(src: str) -> None:
+    assert "".join(text for _, text in split_directives(scan(src))) == src
+
+
+def test_scan_never_yields_directive() -> None:
+    assert scan("#define A 1") == [(CODE, "#define A 1")]
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        ("#define A 1", [(DIRECTIVE, "#define A 1")]),
+        ("x;\n#define A 1\ny;", [(CODE, "x;\n"), (DIRECTIVE, "#define A 1"), (CODE, "\ny;")]),
+        ("\n#a", [(CODE, "\n"), (DIRECTIVE, "#a")]),
+        # Indentation before the `#` belongs to the directive.
+        ("  #if X\ny;", [(DIRECTIVE, "  #if X"), (CODE, "\ny;")]),
+        ("x;\n\t#if X\ny;", [(CODE, "x;\n"), (DIRECTIVE, "\t#if X"), (CODE, "\ny;")]),
+    ],
+)
+def test_simple_directive(src: str, expected: List[Segment]) -> None:
+    assert split_directives(scan(src)) == expected
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        '#define S "a\\nb" x',  # string
+        '#include "a.h"',
+        "#define C '\\n' x",  # char
+        "#define A 1 // c",  # line comment
+        "#define A 1 // c \\\n d",  # line comment continued with `\`
+        "#define A 1 /* c */ 2",  # block comment
+        "#define A 1 /* c\nd */ 2",  # multi-line block comment
+        '#define A "x',  # unclosed string ends at the newline
+    ],
+)
+def test_directive_spans_literals_and_comments(directive: str) -> None:
+    assert split_directives(scan(directive + "\ny;")) == [(DIRECTIVE, directive), (CODE, "\ny;")]
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "#define A \\\n  1",
+        "#define A \\\n  1 + \\\n  2",
+        "#define A /* x */ \\\n 1",
+        "#define A \\  \n  1",  # blanks after the `\` still continue the line
+        "#define A \\\t\n  1",
+    ],
+)
+def test_directive_continuation_lines(directive: str) -> None:
+    assert split_directives(scan(directive + "\ny;")) == [(DIRECTIVE, directive), (CODE, "\ny;")]
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "a # b\n",
+        "x = 1; #define\n",
+        's = "#x";\n',
+        "/* #x */\n",
+        "// #x\n",
+        '"s" #x\n',  # `#` after a string on the same line
+        "x; /* c */ #a\n",  # code before the comment
+        "x; /* a\nb */ #a\ny;",  # code before a comment that ends on the `#` line
+        "__asm { } #a\n",
+    ],
+)
+def test_not_a_directive(src: str) -> None:
+    assert all(seg_type != DIRECTIVE for seg_type, _ in split_directives(scan(src)))
+
+
+def test_consecutive_directives() -> None:
+    # The newline between them stays CODE.
+    assert split_directives(scan("#a\n#b\n")) == [(DIRECTIVE, "#a"), (CODE, "\n"), (DIRECTIVE, "#b"), (CODE, "\n")]
+    assert split_directives(scan("#a\n#b")) == [(DIRECTIVE, "#a"), (CODE, "\n"), (DIRECTIVE, "#b")]
+
+
+def test_directive_after_block_comment_on_previous_line() -> None:
+    assert split_directives(scan("/* c */\n#a\ny;")) == [
+        (SegmentType.BLOCK_COMMENT, "/* c */"),
+        (CODE, "\n"),
+        (DIRECTIVE, "#a"),
+        (CODE, "\ny;"),
+    ]
+
+
+def test_directive_after_asm_block_on_previous_line() -> None:
+    assert split_directives(scan("__asm { }\n#a\n")) == [
+        (SegmentType.ASM, "__asm { }"),
+        (CODE, "\n"),
+        (DIRECTIVE, "#a"),
+        (CODE, "\n"),
+    ]
+
+
+# --- comments before the `#` (`_pop_line_prefix`): currently part of the directive ---
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        ("x;\n/* c */ #define A 1\ny;", [(CODE, "x;\n"), (DIRECTIVE, "/* c */ #define A 1"), (CODE, "\ny;")]),
+        ("/* c */ #a", [(DIRECTIVE, "/* c */ #a")]),
+        ("x;\n\t /* a */ /* b */ #a\n", [(CODE, "x;\n"), (DIRECTIVE, "\t /* a */ /* b */ #a"), (CODE, "\n")]),
+        # A block comment that starts on an earlier line but ends on the `#` line.
+        ("x;\n/* a\nb */ #a\ny;", [(CODE, "x;\n"), (DIRECTIVE, "/* a\nb */ #a"), (CODE, "\ny;")]),
+    ],
+)
+def test_comment_before_hash_belongs_to_directive(src: str, expected: List[Segment]) -> None:
+    assert split_directives(scan(src)) == expected

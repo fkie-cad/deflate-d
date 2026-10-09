@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated.transforms import TightenWhitespace
 
 
@@ -291,6 +293,25 @@ class TestTightenWhitespace:
         assert "while ( 0 )" in out  # its continuation verbatim too
         assert "int c;" in out  # ordinary code still tightened
 
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "#define /* c */ F (x) x\n",  # else `F(x)`: an object-like macro becomes function-like
+            '#define F(x) \\\n  puts("s"); foo \\\n  bar\n',  # else `foo\` + `bar` splices to `foobar`
+            "#define P a /* c */ x # # b\n",  # else `##`: a paste instead of two `#`
+            # A block comment spanning lines continues the directive: `+ 2` belongs to the macro body.
+            "#define A 1 /* x\n y */ + 2\n",
+            # A comment before `#` on the same line is part of the directive line.
+            "/* c */ #define F (x) x\n",
+        ],
+    )
+    def test_directive_split_by_comment_or_string_unchanged(self, src) -> None:
+        assert TightenWhitespace().apply(src) == src
+
+    def test_code_around_directive_with_comment_still_tightened(self) -> None:
+        src = "int  a ;\n#define F /* c */ (x) x\nint  b ;\n"
+        assert TightenWhitespace().apply(src) == "int a;\n#define F /* c */ (x) x\nint b;\n"
+
     def test_word_token_not_glued_to_asm_block(self) -> None:
         # `__asm` begins with a word char and is a separate (opaque) segment, so
         # tightening the code's trailing space away would fuse a preceding word
@@ -302,6 +323,45 @@ class TestTightenWhitespace:
         assert out.startswith("do __asm")
         # Idempotent: a second pass keeps the restored boundary space.
         assert t.apply(out) == out
+
+    @pytest.mark.parametrize(
+        "src, expected",
+        [
+            ("x = a / /* c */ b;", "x=a/ /* c */b;"),  # else `//*` starts a line comment
+            ("x = a / // c\n b;", "x=a/ // c\nb;"),  # else `///` swallows the `/` operator
+        ],
+    )
+    def test_division_not_fused_with_following_comment(self, src, expected) -> None:
+        assert TightenWhitespace().apply(src) == expected
+
+    @pytest.mark.parametrize("prefix", ["L", "u", "U", "u8"])
+    def test_identifier_not_fused_into_literal_prefix(self, prefix) -> None:
+        t = TightenWhitespace()
+        assert t.apply(f'f({prefix} "s");') == f'f({prefix} "s");'
+        assert t.apply(f"f({prefix} 'a');") == f"f({prefix} 'a');"
+        assert t.apply(f'f({prefix}\n"s");') == f'f({prefix}\n"s");'
+
+    @pytest.mark.parametrize("src, expected", [('f(xL "s");', 'f(xL"s");'), ('f(a.L "s");', 'f(a.L "s");')])
+    def test_literal_prefix_only_as_whole_word(self, src, expected) -> None:
+        # Only a whole word `L`, `u`, `U` or `u8` is a prefix, not the end of a longer name; a member `L` still is one.
+        assert TightenWhitespace().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src, expected", [('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'), ("c = u8'a';", "c=u8'a';")]
+    )
+    def test_prefixed_literal_not_split(self, src, expected) -> None:
+        assert TightenWhitespace().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "__asm { nop }",  # nothing before the block
+            "/* c */__asm { nop }",  # a comment, not code, before the block
+            "/* a *///b",  # `*/` is the end of a comment, not a `/` operator: no space added
+        ],
+    )
+    def test_segment_boundary_without_code_before_unchanged(self, src) -> None:
+        assert TightenWhitespace().apply(src) == src
 
     def test_punctuation_still_tightened_before_asm(self) -> None:
         # When the code before the asm block ends in a non-word char there is no

@@ -137,6 +137,10 @@ CONTROL_FLOW_SNIPPETS: dict[str, str] = {
     "goto_label": ('void f(int c)\n\n{\n  if (c != 0) goto LAB_1;\n  puts("a");\nLAB_1:\n  return;\n}\n'),
     # CODE_REVIEW 1.8: `0xFE-1` lexes as one invalid number. Only T1 can fail, since `int-minform` rewrites `0xFE` at T2.
     "hex_e_constant": "uint f(uint c)\n\n{\n  return c + 0xFE - 1;\n}\n",
+    # CODE_REVIEW 1.9: `a / /* c */` fuses into `a//* c */`. Only T1 can fail, since T2 drops comments.
+    "divide_by_commented": "int f(int a, int b)\n\n{\n  return a / /* scale */ b;\n}\n",
+    # CODE_REVIEW 1.10: `ws-newlines` joins the directive onto the comment line. Only T1 can fail, since T2 drops comments.
+    "define_after_comment": "int x; /* counter */\n#define N 4\nint f(void)\n\n{\n  return N;\n}\n",
 }
 
 # CODE_REVIEW 1.1: brace-elision strips the braces, then drop-trailing-return
