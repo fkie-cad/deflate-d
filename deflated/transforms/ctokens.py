@@ -79,23 +79,23 @@ def split_statements(code: str) -> List[str]:
     Each delimiter stays attached to its piece; concatenating the pieces reproduces `code` exactly.
     """
     pieces: List[str] = []
-    current_piece = ""
+    current_piece_parts: List[str] = []
     depth = 0
     for seg_type, text in scan(code):
         if seg_type != SegmentType.CODE:
-            current_piece += text
+            current_piece_parts.append(text)
             continue
         for character in text:
-            current_piece += character
+            current_piece_parts.append(character)
             if character in "([":
                 depth += 1
             elif character in ")]":
                 depth = max(0, depth - 1)
             elif depth == 0 and character in ";{}":
-                pieces.append(current_piece)
-                current_piece = ""
-    if current_piece:
-        pieces.append(current_piece)
+                pieces.append("".join(current_piece_parts))
+                current_piece_parts = []
+    if current_piece_parts:
+        pieces.append("".join(current_piece_parts))
     return pieces
 
 

@@ -24,6 +24,7 @@ class TestTightenCommentSpaces:
             ("a; // x \\\n\nb;", "a; //x \\\n\nb;"),  # blank line after the continuation
             ("a; // x \\\n", "a; //x \\\n"),  # continuation at end of input
             ("a; // x \\\r\n\r\nb;", "a; //x \\\r\n\r\nb;"),  # CRLF
+            ("// a \\\n  b", "//a \\\n b"),  # continued line is collapsed, not stripped
         ],
     )
     def test_newline_after_continuation_kept(self, src, expected) -> None:
@@ -63,7 +64,7 @@ class TestTightenCommentSpaces:
         assert t.apply("/* some \tcomment */") == "/*some comment*/"
 
     def test_block_comment_newlines_preserved(self) -> None:
-        # Horizontal whitespace is stripped/collapsed per line, but newlines stay.
+        # Horizontal whitespace is stripped at both ends of the comment and collapsed elsewhere; newlines stay.
         t = TightenCommentSpaces()
         assert t.apply("/* \n * first\n * second\n */") == "/*\n * first\n * second\n*/"
 

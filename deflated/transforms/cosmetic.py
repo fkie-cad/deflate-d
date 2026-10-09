@@ -91,12 +91,12 @@ def _tighten_line(line: str) -> str:
     Remove all spaces and tabs from `line`, keeping a single space only where `_needs_space` requires one.
     """
     parts = _BLANKS.split(line.strip(" \t"))
-    tightened_line: str = parts[0]
+    tightened_parts: List[str] = [parts[0]]
     for left, right in pairwise(parts):
         if _needs_space(left, right):
-            tightened_line += " "
-        tightened_line += right
-    return tightened_line
+            tightened_parts.append(" ")
+        tightened_parts.append(right)
+    return "".join(tightened_parts)
 
 
 def _directive_flags(all_lines: List[str]) -> List[bool]:
@@ -178,21 +178,21 @@ class TightenCommentSpaces(Transform):
     description = "Strip and collapse whitespace inside comments."
 
     def apply(self, code: str) -> str:
-        transformed_code: str = ""
+        transformed_segments: List[str] = []
         for seg_type, text in scan(code):
             if seg_type == SegmentType.LINE_COMMENT:
                 interior = _BLANKS.sub(" ", text[2:]).strip(" \t")
-                transformed_code += "//" + interior
+                transformed_segments.append("//" + interior)
             elif seg_type == SegmentType.BLOCK_COMMENT:
                 # An unterminated `/* ...` (run to EOF by the lexer) has no closer to strip or re-append:
                 # keep the interior but don't fabricate `*/`. Note, `/*/` opens a comment, but does not close it.
                 is_closed = text != "/*/" and text.endswith("*/")
                 interior = text[2:-2] if is_closed else text[2:]
                 interior = _BLANKS.sub(" ", interior).strip(" \t")
-                transformed_code += "/*" + interior + ("*/" if is_closed else "")
+                transformed_segments.append("/*" + interior + ("*/" if is_closed else ""))
             else:
-                transformed_code += text
-        return transformed_code
+                transformed_segments.append(text)
+        return "".join(transformed_segments)
 
 
 class TightenWhitespace(Transform):
@@ -202,7 +202,7 @@ class TightenWhitespace(Transform):
     One space is kept where `_needs_space` requires it: between word characters (`int d`), between characters that
     would fuse into another token (`a - -b`, `a / *p`), and where a number would absorb a `.`. Preprocessor lines are
     left unchanged. A space is also kept before an `__asm` block if the code before it ends in a word character;
-    otherwise `do __asm{...}` becomes `do__asm{...}` and the lexer no longer recognises the block.
+    otherwise `do __asm{...}` becomes `do__asm{...}` and the lexer no longer recognizes the block.
     """
 
     id = "ws-tighten"
@@ -212,16 +212,16 @@ class TightenWhitespace(Transform):
     def apply(self, code: str) -> str:
         segments = scan(code)
         next_types = [seg_type for seg_type, _ in segments[1:]] + [None]
-        out: List[str] = []
+        transformed_segments: List[str] = []
         for (seg_type, text), next_type in zip(segments, next_types):
             if seg_type != SegmentType.CODE:
-                out.append(text)
+                transformed_segments.append(text)
                 continue
             tight = self._tighten(text)
             if next_type == SegmentType.ASM and tight and _is_word_char(tight[-1]):
                 tight += " "
-            out.append(tight)
-        return "".join(out)
+            transformed_segments.append(tight)
+        return "".join(transformed_segments)
 
     @staticmethod
     def _tighten(text: str) -> str:
