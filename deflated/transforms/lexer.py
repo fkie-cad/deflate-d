@@ -163,7 +163,7 @@ def _code_lines(segments: List[Segment]) -> Iterator[Segment]:
 
 
 def _merge_code(segments: List[Segment]) -> List[Segment]:
-    """Join neighbouring CODE segments into one."""
+    """Join neighboring CODE segments into one."""
     merged: List[Segment] = []
     for seg_type, text in segments:
         if seg_type == SegmentType.CODE and merged and merged[-1][0] == SegmentType.CODE:
@@ -197,14 +197,14 @@ def split_directives(segments: List[Segment]) -> List[Segment]:
     split_segments: List[Segment] = []
     directive: Optional[str] = None
     at_line_start = True  # only blanks and block comments since the last newline in code
-    continued = False  # the code just before ends in a `\`
+    after_backslash = False  # the code just before ends in a `\`
     for seg_type, text in _code_lines(segments):
-        ends_line = seg_type == SegmentType.CODE and text == "\n" and not continued
-        continued = seg_type == SegmentType.CODE and text.rstrip().endswith("\\")
-        if directive is not None and not ends_line:
-            directive += text
-            continue
+        ends_line = seg_type == SegmentType.CODE and text == "\n" and not after_backslash
+        after_backslash = seg_type == SegmentType.CODE and text.rstrip().endswith("\\")
         if directive is not None:
+            if not ends_line:
+                directive += text
+                continue
             split_segments.append((SegmentType.DIRECTIVE, directive))
             directive = None
         elif at_line_start and seg_type == SegmentType.CODE and text.lstrip(" \t").startswith("#"):
