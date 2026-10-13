@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import string
-from typing import NamedTuple, Tuple, List
+from typing import List, NamedTuple, Tuple
 
 from .lexer import SegmentType, scan
 
@@ -46,7 +46,10 @@ CINT = re.compile(r"(0[xX][0-9a-fA-F]+|\d+)([uUlL]*|[uU]?i(?:8|16|32|64))")
 # A single C token: multi-char operators first (so they are not split), then identifiers, numeric literals, and finally
 # any single non-space character.
 CTOKEN = re.compile(
-    r"<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^=" r"|[A-Za-z_]\w*" rf"|{CNUMBER.pattern}" r"|\S"
+    r"<<=|>>=|->|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|/=|%=|&=|\|=|\^="
+    r"|[A-Za-z_]\w*"
+    rf"|{CNUMBER.pattern}"
+    r"|\S"
 )
 
 

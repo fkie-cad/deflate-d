@@ -2,9 +2,9 @@
 T1 cosmetic transforms: whitespace and layout changes only, so all of them are semantics-preserving.
 
 No pass changes the inside of a string, char literal or `__asm { ... }` block. MSVC's brace-less `__asm` form is not
-supported: decompilers don't emit it, and the lexer reads it as plain code. `ws-collapse`, `ws-tighten`, `ws-comments` and
-`ws-newlines` work on the segments from `scan`. `ws-indent`, `ws-trailing` and `ws-blanklines` work line by line and
-use `lines_with_protection` to skip line edges that lie inside a protected segment.
+supported: decompilers don't emit it, and the lexer reads it as plain code. `ws-collapse`, `ws-tighten`, `ws-comments`
+and `ws-newlines` work on the segments from `scan`. `ws-indent`, `ws-trailing` and `ws-blanklines` work line by line
+and use `lines_with_protection` to skip line edges that lie inside a protected segment.
 """
 
 from __future__ import annotations
@@ -111,9 +111,7 @@ def _needs_space(left: str, right: str) -> bool:
 
 
 def _tighten_line(line: str) -> str:
-    """
-    Remove all spaces and tabs from `line`, keeping a single space only where `_needs_space` requires one.
-    """
+    """Remove all spaces and tabs from `line`, keeping a single space only where `_needs_space` requires one."""
     parts = _BLANKS.split(line.strip(" \t"))
     tightened_parts: List[str] = [parts[0]]
     for left, right in pairwise(parts):
@@ -136,6 +134,9 @@ class CollapseInlineSpaces(Transform):
     description = "Collapse any combination of 2+ spaces/tabs into a single space in code."
 
     def apply(self, code: str) -> str:
+        """
+        Return `code` with every run of 2+ spaces/tabs in code replaced by one space.
+        """
         return map_code(code, lambda s: _MULTI_BLANKS.sub(" ", s))
 
 
@@ -147,7 +148,12 @@ class StripIndentation(Transform):
     description = "Remove leading whitespace from each line."
 
     def apply(self, code: str) -> str:
-        return "\n".join(line if starts_protected else line.lstrip() for line, starts_protected, _ in lines_with_protection(code))
+        """
+        Return `code` with the leading whitespace of every unprotected line removed.
+        """
+        return "\n".join(
+            line if starts_protected else line.lstrip() for line, starts_protected, _ in lines_with_protection(code)
+        )
 
 
 class StripTrailingWhitespace(Transform):
@@ -158,7 +164,10 @@ class StripTrailingWhitespace(Transform):
     description = "Remove trailing whitespace from each line."
 
     def apply(self, code: str) -> str:
-        return "\n".join(line if ends_protected else line.rstrip() for line, _, ends_protected in lines_with_protection(code))
+        """Return `code` with the trailing whitespace of every unprotected line removed."""
+        return "\n".join(
+            line if ends_protected else line.rstrip() for line, _, ends_protected in lines_with_protection(code)
+        )
 
 
 class CollapseBlankLines(Transform):
@@ -171,6 +180,9 @@ class CollapseBlankLines(Transform):
     description = "Collapse consecutive blank lines to one and drop leading/trailing blanks."
 
     def apply(self, code: str) -> str:
+        """
+        Return `code` with every run of blank lines reduced to one and no blank lines at the start or end.
+        """
         transformed_code_lines: List[str] = []
         for line, starts_protected, _ in lines_with_protection(code):
             if line.strip() or starts_protected:  # real content, or protected string interior
@@ -194,6 +206,7 @@ class TightenCommentSpaces(Transform):
     description = "Strip and collapse whitespace inside comments."
 
     def apply(self, code: str) -> str:
+        """Return `code` with the whitespace inside every comment tightened."""
         transformed_segments: List[str] = []
         for seg_type, text in scan(code):
             if seg_type == SegmentType.LINE_COMMENT:
@@ -227,6 +240,7 @@ class TightenWhitespace(Transform):
     description = "Remove unnecessary whitespace (includes most of ws-collapse, ws-indent, ws-trailing)."
 
     def apply(self, code: str) -> str:
+        """Return `code` with every space or tab removed that is not needed, leaving directives unchanged."""
         transformed_segments: List[str] = []
         previous_type: Optional[SegmentType] = None
         for seg_type, text in split_directives(scan(code)):
@@ -246,9 +260,7 @@ class TightenWhitespace(Transform):
 
     @staticmethod
     def _tighten(text: str) -> str:
-        """
-        Tighten each line of the CODE piece `text` with `_tighten_line`.
-        """
+        """Tighten each line of the CODE piece `text` with `_tighten_line`."""
         return "\n".join(_tighten_line(line) for line in text.split("\n"))
 
 
@@ -272,6 +284,7 @@ class JoinLines(Transform):
     description = "Join lines into as few as possible, keeping only the line breaks the code needs."
 
     def apply(self, code: str) -> str:
+        """Return `code` joined into as few lines as possible."""
         pieces = split_directives(scan(code))
         pieces_before_frozen_line = self._line_breaks_before_frozen_strings(pieces)
         transformed_segments: List[str] = []
@@ -279,6 +292,7 @@ class JoinLines(Transform):
         closed_string_on_line = False
 
         def append_separated(segment: str, is_closed_string: bool = False) -> None:
+            """Append `segment`, with a space before it if needed, and track whether the line holds a closed string."""
             nonlocal closed_string_on_line
             if not segment:
                 return
@@ -291,6 +305,7 @@ class JoinLines(Transform):
                 closed_string_on_line = True
 
         def start_new_line() -> None:
+            """Append a newline unless the output is empty or already ends with one."""
             if transformed_segments and not transformed_segments[-1].endswith("\n"):
                 append_separated("\n")
 
@@ -320,9 +335,7 @@ class JoinLines(Transform):
 
     @staticmethod
     def _line_breaks_before_frozen_strings(pieces: List[Segment]) -> Set[int]:
-        """
-        Return the indices of the CODE pieces that hold the last line break before a frozen string.
-        """
+        """Return the indices of the CODE pieces that hold the last line break before a frozen string."""
         indices: Set[int] = set()
         for index, (piece_type, text) in enumerate(pieces):
             if not _is_frozen_string(piece_type, text):
@@ -337,7 +350,5 @@ class JoinLines(Transform):
 
     @staticmethod
     def _collapse(text: str) -> str:
-        """
-        Join the lines of the CODE piece `text` with single spaces and drop blank lines.
-        """
+        """Join the lines of the CODE piece `text` with single spaces and drop blank lines."""
         return " ".join(line.strip() for line in text.split("\n") if line.strip())

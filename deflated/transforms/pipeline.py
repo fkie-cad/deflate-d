@@ -100,7 +100,8 @@ ORDERED_TRANSFORMS: list[type[Transform]] = [
     CanonicalizeControlFlow,  # T2 (label/jump cleanup)
     MinimizeIntegerLiterals,  # T2 (hex int literals -> shorter decimal; lossless)
     DerefOffsetToIndex,  # T2 (*(p+N) -> p[N]; lossless)
-    DropTrailingReturn,  # T2 (drops redundant trailing `return;`)
+    DropTrailingReturn,  # T2 (drops redundant trailing `return;`; after brace-elision, which turns
+    #     `if (c) { return; }` into `if (c) return;`, so the unbraced body must be kept)
     CompressFunctionNames,  # T3 (file-global; runs before locals)
     CompressPlaceholderNames,  # T3
     SimplifyLowConfidenceTypes,  # T3

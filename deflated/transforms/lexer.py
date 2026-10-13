@@ -68,8 +68,8 @@ def _closes_backtick_name(src: str, code_start: int, quote_pos: int) -> bool:
 
 def _literal_start(src: str, code_start: int, quote_pos: int) -> int:
     """
-    Start of the literal whose quote is at `src[quote_pos]`: at its encoding prefix if a whole word `L`, `u`, `U` or `u8`
-    in the pending code run (from `code_start`) directly precedes the quote, else at the quote.
+    Start of the literal whose quote is at `src[quote_pos]`: at its encoding prefix if a whole word `L`, `u`, `U` or
+    `u8` in the pending code run (from `code_start`) directly precedes the quote, else at the quote.
     """
     match = _LITERAL_PREFIX_BEFORE_QUOTE.search(src, max(code_start, quote_pos - 2), quote_pos)
     return match.start() if match else quote_pos
@@ -261,7 +261,9 @@ def lines_with_protection(code: str) -> List[Tuple[str, bool, bool]]:
     line_start = 0
     for line in code.split("\n"):
         if line:
-            protected_ends.append((line, bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1])))
+            protected_ends.append(
+                (line, bool(protected_mask[line_start]), bool(protected_mask[line_start + len(line) - 1]))
+            )
         else:
             inside_protected_area = bool(protected_mask[line_start]) if line_start < len(code) else False
             protected_ends.append((line, inside_protected_area, inside_protected_area))

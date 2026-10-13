@@ -46,7 +46,8 @@ DECOMPILER_LITERALS = [
 ]
 
 # Not seen from a decompiler, but valid C the lexer still must not split. C++ digit separators (`1'000'000`) are
-# deliberately out of scope: no decompiler emits them, and a pp-number rule covering `'` would collide with char literals.
+# deliberately out of scope: no decompiler emits them, and a pp-number rule covering `'` would collide with char
+# literals.
 EXOTIC_LITERALS = [
     "1.5e-3f",  # signed exponent + float suffix
     "2.5E+10",  # uppercase exponent

@@ -349,7 +349,9 @@ class TestTightenWhitespace:
         # Only a whole word `L`, `u`, `U` or `u8` is a prefix, not the end of a longer name; a member `L` still is one.
         assert TightenWhitespace().apply(src) == expected
 
-    @pytest.mark.parametrize("src, expected", [('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'), ("c = u8'a';", "c=u8'a';")])
+    @pytest.mark.parametrize(
+        "src, expected", [('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'), ("c = u8'a';", "c=u8'a';")]
+    )
     def test_prefixed_literal_not_split(self, src, expected) -> None:
         assert TightenWhitespace().apply(src) == expected
 

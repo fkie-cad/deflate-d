@@ -14,7 +14,7 @@ from collections import Counter
 
 from .base import Tier, Transform
 from .contextual import _IDENT, _RESERVED
-from .ctokens import CINT, CNUMBER, ctokenize as _tok_offsets, match_delimiter as _match_delim, split_args as _split_args
+from .ctokens import CINT, CNUMBER, ctokenize, match_delimiter, split_args
 from .lexer import SegmentType, scan
 
 
@@ -32,7 +32,10 @@ class RemoveWarningComments(Transform):
     description = "Remove the decompiler's WARNING unreliability banners."
 
     def apply(self, code: str) -> str:
-        return "".join(" " if (seg_type == SegmentType.BLOCK_COMMENT and "WARNING" in text) else text for seg_type, text in scan(code))
+        return "".join(
+            " " if (seg_type == SegmentType.BLOCK_COMMENT and "WARNING" in text) else text
+            for seg_type, text in scan(code)
+        )
 
 
 class DropCodePointerCast(Transform):
@@ -57,7 +60,7 @@ class DropCodePointerCast(Transform):
     description = "Drop Ghidra's (code *) cast on an indirect call."
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         cuts: list[tuple[int, int]] = []
         i = 0
@@ -151,7 +154,7 @@ class StripWidthCasts(Transform):
         return code
 
     def _strip_once(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         cuts: list[tuple[int, int]] = []
         i = 0
@@ -159,7 +162,11 @@ class StripWidthCasts(Transform):
             if toks[i][0] == "(" and i + 2 < n and toks[i + 1][0] in self._types and toks[i + 2][0] == ")":
                 prev = toks[i - 1][0] if i > 0 else None
                 after = toks[i + 3][0] if i + 3 < n else None
-                if self._operand_starts(after) and not self._prev_is_value(prev) and self._literal_safe(toks[i + 1][0], toks, i + 3, n):
+                if (
+                    self._operand_starts(after)
+                    and not self._prev_is_value(prev)
+                    and self._literal_safe(toks[i + 1][0], toks, i + 3, n)
+                ):
                     cuts.append((toks[i][1], toks[i + 2][2]))
                     i += 3
                     continue
@@ -194,7 +201,7 @@ class StripWidthCasts(Transform):
         # would; a multi-token expression in parens falls under the same trade as
         # a bare variable, so allow it.
         if tok == "(":
-            close = _match_delim(toks, j)
+            close = match_delimiter(toks, j)
             if close == j + 2:
                 return cls._literal_safe(cast_type, toks, j + 1, n)
             return True
@@ -226,7 +233,9 @@ class StripWidthCasts(Transform):
     def _operand_starts(tok: str | None) -> bool:
         if tok is None:
             return False
-        return bool(tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or CNUMBER.fullmatch(tok) or tok[0] in "\"'")
+        return bool(
+            tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or CNUMBER.fullmatch(tok) or tok[0] in "\"'"
+        )
 
     @staticmethod
     def _prev_is_value(prev: str | None) -> bool:
@@ -238,7 +247,11 @@ class StripWidthCasts(Transform):
             return False
         if prev == "sizeof":
             return True
-        return bool(prev in {")", "]"} or CNUMBER.fullmatch(prev) or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW))
+        return bool(
+            prev in {")", "]"}
+            or CNUMBER.fullmatch(prev)
+            or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW)
+        )
 
 
 class StripCallingConventions(Transform):
@@ -439,7 +452,7 @@ class StripChkSuffix(Transform):
     _RX = re.compile(r"_{1,2}(\w+?)_chk")
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         edits: list[tuple[int, int, str]] = []
         for i, (text, start, end) in enumerate(toks):
@@ -500,7 +513,7 @@ class StripTranslationWrappers(Transform):
     _CALL_PREV_KW = frozenset({"return", "else", "do"})
 
     def _unwrap_once(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         edits: list[tuple[int, int, str]] = []
         i = 0
@@ -508,7 +521,7 @@ class StripTranslationWrappers(Transform):
             spec = self.WRAPPERS.get(toks[i][0])
             if spec and toks[i + 1][0] == "(":
                 prev = toks[i - 1][0] if i > 0 else None
-                close = _match_delim(toks, i + 1)
+                close = match_delimiter(toks, i + 1)
                 # Skip a member access (`p->gettext(...)`) and a declarator (a
                 # gettext *prototype/definition* such as
                 # `char *dcgettext(const char *a, const char *msgid, int c) {` is
@@ -516,11 +529,13 @@ class StripTranslationWrappers(Transform):
                 # return type (`*` or a type/identifier word, not a call-prev
                 # keyword), or the `)` is immediately followed by a `{` body.
                 is_member = prev in (".", "->")
-                is_declarator = prev == "*" or (prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW)
+                is_declarator = prev == "*" or (
+                    prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW
+                )
                 is_def = close is not None and close + 1 < n and toks[close + 1][0] == "{"
                 if close is not None and not is_member and not is_declarator and not is_def:
                     arity, keep = spec
-                    args = _split_args(toks, i + 1)
+                    args = split_args(toks, i + 1)
                     if args is not None and len(args) == arity:
                         lo_t, hi_t = args[keep]
                         if lo_t < hi_t:
@@ -597,7 +612,7 @@ class ElideThunkBodies(Transform):
     _MIN_FORWARD_FAMILY = 2
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         funcs = _top_level_functions(toks)
         if not funcs:
             return code
@@ -911,11 +926,11 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
             and toks[i + 1][0] == "("
             and (i + 2 >= n or toks[i + 2][0] != "*")
         ):
-            close = _match_delim(toks, i + 1)
+            close = match_delimiter(toks, i + 1)
             if close is not None:
                 bo = _body_open_after(toks, close, n)
                 if bo is not None:
-                    bc = _match_delim(toks, bo)
+                    bc = match_delimiter(toks, bo)
                     if bc is not None:
                         out.append((t, seg_start, bo, bc, toks[bc][2]))
                         seg_start = toks[bc][2]
@@ -960,7 +975,7 @@ class EraseResolverStubs(Transform):
     _MIN_FAMILY = 3
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         funcs = _top_level_functions(toks)
         if not funcs:
             return code
@@ -998,7 +1013,13 @@ class EraseResolverStubs(Transform):
             if not stmt:
                 continue
             if stmt[0] == "return":
-                if call is not None or len(stmt) < 4 or not _IDENT.fullmatch(stmt[1]) or stmt[2] != "(" or stmt[-1] != ")":
+                if (
+                    call is not None
+                    or len(stmt) < 4
+                    or not _IDENT.fullmatch(stmt[1])
+                    or stmt[2] != "("
+                    or stmt[-1] != ")"
+                ):
                     return None
                 if stmt[3:-1]:  # the call must take no arguments
                     return None
@@ -1075,7 +1096,7 @@ class DropCrtFunctions(Transform):
     )
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         candidates = [
             (name, ss, bce)
             for name, ss, bo, bc, bce in _top_level_functions(toks)
@@ -1194,7 +1215,7 @@ class TrimSpuriousArgs(Transform):
     }
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         edits: list[tuple[int, int]] = []
         i = 0
@@ -1217,7 +1238,7 @@ class TrimSpuriousArgs(Transform):
             if prev == "*" or (prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW):
                 i += 1
                 continue
-            close = _match_delim(toks, i + 1)
+            close = match_delimiter(toks, i + 1)
             if close is None:
                 i += 1
                 continue
@@ -1225,7 +1246,7 @@ class TrimSpuriousArgs(Transform):
             if close + 1 < n and toks[close + 1][0] == "{":
                 i = close + 1
                 continue
-            args = _split_args(toks, i + 1)
+            args = split_args(toks, i + 1)
             if args is not None and len(args) > arity:
                 # Keep the first `arity` args; cut from the end of arg[arity-1]
                 # to just before `)`.

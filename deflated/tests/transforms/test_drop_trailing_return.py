@@ -43,3 +43,16 @@ class TestDropTrailingReturn:
         # `cleanup: }` is a label with no statement (invalid C before C23).
         src = "void f(int x){if(x)goto cleanup;do_work();cleanup:return;}"
         assert DropTrailingReturn().apply(src) == src
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "void f(int c){ g(); if (c) return; }",
+            'void f(int c){ if (c) puts("a"); else return; }',
+            "void f(int c){ for (;c;) return; }",
+            "void f(int c){ while (c) return; }",
+        ],
+    )
+    def test_keeps_return_that_is_an_unbraced_body(self, src) -> None:
+        # Dropping it would leave `if (c) }` / `else }`, which is invalid C.
+        assert DropTrailingReturn().apply(src) == src

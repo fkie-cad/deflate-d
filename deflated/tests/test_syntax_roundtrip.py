@@ -28,7 +28,7 @@ The file corpus alone exercises only the shapes the samples happen to contain,
 which is why :data:`CONTROL_FLOW_SNIPPETS` adds a few minimal functions covering
 the control-flow forms the structural passes rewrite. That is where bug 1.1
 (``drop-trailing-return`` eating a ``return;`` that is an ``if``/``else`` body,
-leaving ``if(c)}``) actually shows up; see :data:`XFAIL_RETURN_IN_BRANCH`.
+leaving ``if(c)}``) showed up.
 """
 
 from __future__ import annotations
@@ -124,30 +124,28 @@ CONTROL_FLOW_SNIPPETS: dict[str, str] = {
     "return_in_else": ('void f(int c)\n\n{\n  if (c != 0) {\n    puts("a");\n  }\n  else {\n    return;\n  }\n}\n'),
     "return_in_while": "void f(int c)\n\n{\n  while (c != 0) {\n    c = c + -1;\n    return;\n  }\n}\n",
     "for_loop": (
-        "void f(int c)\n\n{\n  int iVar1;\n" '  for (iVar1 = 0; iVar1 < c; iVar1 = iVar1 + 1) {\n    puts("y");\n  }\n  return;\n}\n'
+        "void f(int c)\n\n{\n  int iVar1;\n"
+        '  for (iVar1 = 0; iVar1 < c; iVar1 = iVar1 + 1) {\n    puts("y");\n  }\n  return;\n}\n'
     ),
     "do_while": "void f(int c)\n\n{\n  do {\n    c = c + -1;\n  } while (c != 0);\n  return;\n}\n",
     "switch": (
-        "void f(int c)\n\n{\n  switch(c) {\n" '  case 1:\n    puts("a");\n    break;\n  default:\n    puts("b");\n  }\n  return;\n}\n'
+        "void f(int c)\n\n{\n  switch(c) {\n"
+        '  case 1:\n    puts("a");\n    break;\n  default:\n    puts("b");\n  }\n  return;\n}\n'
     ),
     "if_else_assign": (
         "undefined4 f(int c)\n\n{\n  undefined4 uVar1;\n"
         "  if (c != 0) {\n    uVar1 = 1;\n  }\n  else {\n    uVar1 = 2;\n  }\n  return uVar1;\n}\n"
     ),
     "goto_label": ('void f(int c)\n\n{\n  if (c != 0) goto LAB_1;\n  puts("a");\nLAB_1:\n  return;\n}\n'),
-    # CODE_REVIEW 1.8: `0xFE-1` lexes as one invalid number. Only T1 can fail, since `int-minform` rewrites `0xFE` at T2.
+    # CODE_REVIEW 1.8: `0xFE-1` lexes as one invalid number. Only T1 can fail, since `int-minform` rewrites `0xFE` at
+    # T2.
     "hex_e_constant": "uint f(uint c)\n\n{\n  return c + 0xFE - 1;\n}\n",
     # CODE_REVIEW 1.9: `a / /* c */` fuses into `a//* c */`. Only T1 can fail, since T2 drops comments.
     "divide_by_commented": "int f(int a, int b)\n\n{\n  return a / /* scale */ b;\n}\n",
-    # CODE_REVIEW 1.10: `ws-newlines` joins the directive onto the comment line. Only T1 can fail, since T2 drops comments.
+    # CODE_REVIEW 1.10: `ws-newlines` joins the directive onto the comment line. Only T1 can fail, since T2 drops
+    # comments.
     "define_after_comment": "int x; /* counter */\n#define N 4\nint f(void)\n\n{\n  return N;\n}\n",
 }
-
-# CODE_REVIEW 1.1: brace-elision strips the braces, then drop-trailing-return
-# removes the now-bare `return;` that was the whole body of the branch, leaving
-# `if(c!=0)}` / `else}`. Non-strict so the suite stays green until 1.1 is fixed,
-# at which point these turn into XPASS and the marks can go.
-XFAIL_RETURN_IN_BRANCH = {("return_in_if", "T2"), ("return_in_else", "T2")}
 
 
 def syntax_check(source: str, tmp_path: Path) -> tuple[bool, str]:
@@ -167,12 +165,7 @@ def syntax_check(source: str, tmp_path: Path) -> tuple[bool, str]:
 def _snippet_params() -> Iterator[pytest.ParameterSet]:
     for name, src in CONTROL_FLOW_SNIPPETS.items():
         for tier in LOSSLESS_TIERS:
-            marks = (
-                [pytest.mark.xfail(reason="CODE_REVIEW 1.1 drop-trailing-return", strict=False)]
-                if (name, tier) in XFAIL_RETURN_IN_BRANCH
-                else []
-            )
-            yield pytest.param(src, tier, id=f"{name}-{tier}", marks=marks)
+            yield pytest.param(src, tier, id=f"{name}-{tier}")
 
 
 # --- the tripwire: the raw corpus is exactly as documented ---
@@ -187,7 +180,10 @@ def test_raw_corpus_split_is_as_documented(path: Path, tmp_path: Path) -> None:
     # failure mode impossible to miss.
     ok, stderr = syntax_check(path.read_text(encoding="utf-8"), tmp_path)
     if path.name in RAW_UNCOMPILABLE:
-        assert not ok, f"{path.name} now compiles raw; drop it from RAW_UNCOMPILABLE " f"(recorded reason: {RAW_UNCOMPILABLE[path.name]})"
+        assert not ok, (
+            f"{path.name} now compiles raw; drop it from RAW_UNCOMPILABLE "
+            f"(recorded reason: {RAW_UNCOMPILABLE[path.name]})"
+        )
     else:
         assert ok, f"{path.name} no longer compiles raw --- the prelude is incomplete:\n{stderr}"
 

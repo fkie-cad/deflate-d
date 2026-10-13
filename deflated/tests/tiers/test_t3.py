@@ -5,7 +5,16 @@ from __future__ import annotations
 from deflated import Tier, transform
 from deflated.transforms import build_pipeline
 
-T2_IDS = {"comments", "ternary", "inline-temps", "decl-coalesce", "cast-elision", "brace-elision", "compound-assign", "cfg-canon"}
+T2_IDS = {
+    "comments",
+    "ternary",
+    "inline-temps",
+    "decl-coalesce",
+    "cast-elision",
+    "brace-elision",
+    "compound-assign",
+    "cfg-canon",
+}
 T3_IDS = {"compress-funcs", "compress-names", "simplify-types"}
 
 

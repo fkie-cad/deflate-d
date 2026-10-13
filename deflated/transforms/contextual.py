@@ -14,7 +14,7 @@ import re
 import string
 
 from .base import Tier, Transform
-from .ctokens import CINT, CNUMBER, ctokenize as _tok_offsets, match_delimiter as _match_delim
+from .ctokens import CINT, CNUMBER, ctokenize, match_delimiter
 from .lexer import SegmentType, scan
 
 # Keywords/types we must never hand out as a generated short name.
@@ -113,7 +113,7 @@ def _struct_body_spans(code: str) -> list[tuple[int, int]]:
     Token-based, so braces inside strings/comments are ignored; empty (the common
     case) when the unit defines no aggregates inline.
     """
-    toks = _tok_offsets(code)
+    toks = ctokenize(code)
     n = len(toks)
     spans: list[tuple[int, int]] = []
     i = 0
@@ -123,7 +123,7 @@ def _struct_body_spans(code: str) -> list[tuple[int, int]]:
             while j < n and _IDENT.fullmatch(toks[j][0]):  # optional tag name
                 j += 1
             if j < n and toks[j][0] == "{":
-                close = _match_delim(toks, j)
+                close = match_delimiter(toks, j)
                 if close is not None:
                     spans.append((toks[j][1], toks[close][2]))
                     i = close + 1
@@ -212,17 +212,22 @@ class CompressFunctionNames(Transform):
 
     def apply(self, code: str) -> str:
         segments = scan(code)
-        targets = self._defined_functions(segments) if self._require_definition else self._all_placeholder_funcs(segments)
+        targets = (
+            self._defined_functions(segments) if self._require_definition else self._all_placeholder_funcs(segments)
+        )
         if not targets:
             return code
 
-        existing = {m.group(0) for seg_type, text in segments if seg_type == SegmentType.CODE for m in _IDENT.finditer(text)}
+        existing = {
+            m.group(0) for seg_type, text in segments if seg_type == SegmentType.CODE for m in _IDENT.finditer(text)
+        }
         gen = _short_names(used=set(existing))
         mapping = {name: next(gen) for name in targets}
 
         big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
         return "".join(
-            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments
+            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text)
+            for seg_type, text in segments
         )
 
     def _all_placeholder_funcs(self, segments: list[tuple[str, str]]) -> list[str]:
@@ -241,7 +246,12 @@ class CompressFunctionNames(Transform):
 
     def _defined_functions(self, segments: list[tuple[str, str]]) -> list[str]:
         """Names with an in-file definition (``NAME(...) {``), first-seen order."""
-        toks = [m.group(0) for seg_type, text in segments if seg_type == SegmentType.CODE for m in re.finditer(r"[A-Za-z_]\w*|\S", text)]
+        toks = [
+            m.group(0)
+            for seg_type, text in segments
+            if seg_type == SegmentType.CODE
+            for m in re.finditer(r"[A-Za-z_]\w*|\S", text)
+        ]
         found: list[str] = []
         seen: set[str] = set()
         n = len(toks)
@@ -605,18 +615,36 @@ class DropNullPointerCast(Transform):
     description = "Drop a redundant pointer cast on a null constant."
 
     # Tokens after which a bare null constant is a complete, unambiguous operand.
-    _SAFE_BEFORE = frozenset({"=", "==", "!=", "<", ">", "<=", ">=", "(", "[", "{", ",", ";", "return", "?", ":", "&&", "||", "!", "}"})
+    _SAFE_BEFORE = frozenset(
+        {"=", "==", "!=", "<", ">", "<=", ">=", "(", "[", "{", ",", ";", "return", "?", ":", "&&", "||", "!", "}"}
+    )
     # Operators that take a *type* operand: a cast directly inside their `(` is
     # load-bearing (it fixes the operand type), so the pointer cast on the null is
     # NOT redundant there and must be kept (`sizeof((char *)0x0)` is `sizeof(char*)`,
     # not `sizeof(0)`). The `(` of one of these reads as a `_SAFE_BEFORE` token, so
     # it is excluded explicitly.
-    _TYPE_OP_BEFORE_PAREN = frozenset({"sizeof", "_Alignof", "alignof", "__alignof__", "typeof", "__typeof__", "decltype"})
+    _TYPE_OP_BEFORE_PAREN = frozenset(
+        {"sizeof", "_Alignof", "alignof", "__alignof__", "typeof", "__typeof__", "decltype"}
+    )
     # Keywords that, before a `(`, make it a *grouping* paren rather than a call:
     # `return ((T *)0x0)` is a group, `f((T *)0x0)` is a call. Used to tell the two
     # apart when the cast+null is wrapped in its own parens (see apply()).
     _GROUPING_BEFORE = frozenset(
-        {"return", "sizeof", "if", "while", "for", "switch", "case", "do", "else", "goto", "_Alignof", "alignof", "typeof"}
+        {
+            "return",
+            "sizeof",
+            "if",
+            "while",
+            "for",
+            "switch",
+            "case",
+            "do",
+            "else",
+            "goto",
+            "_Alignof",
+            "alignof",
+            "typeof",
+        }
     )
     # Tokens that may follow the null literal without the int/pointer distinction mattering.
     _SAFE_AFTER = frozenset({")", ";", ",", "]", "}", ":", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "?"})
@@ -627,7 +655,7 @@ class DropNullPointerCast(Transform):
     _NULL = frozenset({"0x0", "0X0", "0"})
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         edits: list[tuple[int, int]] = []
         i = 0
@@ -635,7 +663,7 @@ class DropNullPointerCast(Transform):
             if toks[i][0] != "(":
                 i += 1
                 continue
-            close = _match_delim(toks, i)
+            close = match_delimiter(toks, i)
             # Need a non-empty cast body and a token after the `)` to inspect.
             if close is None or close <= i + 1 or close + 1 >= n:
                 i += 1
@@ -653,7 +681,9 @@ class DropNullPointerCast(Transform):
             # after, so no arithmetic can follow) are both safe operand positions.
             before = toks[i - 1][0] if i > 0 else None
             after = toks[null_idx + 1][0] if null_idx + 1 < n else None
-            if (before is not None and before not in self._SAFE_BEFORE) or (after is not None and after not in self._SAFE_AFTER):
+            if (before is not None and before not in self._SAFE_BEFORE) or (
+                after is not None and after not in self._SAFE_AFTER
+            ):
                 i += 1
                 continue
             # `sizeof((T *)0x0)` / `_Alignof((T *)0x0)`: the cast fixes the operand
@@ -669,10 +699,11 @@ class DropNullPointerCast(Transform):
             # grouping re-checks the token after the closing paren. (Decompilers
             # don't emit this double-paren shape, so this only restores the
             # pass's stated decline-when-ambiguous contract.)
-            if before == "(" and after == ")" and _match_delim(toks, i - 1) == null_idx + 1:
+            if before == "(" and after == ")" and match_delimiter(toks, i - 1) == null_idx + 1:
                 outer_before = toks[i - 2][0] if i >= 2 else None
                 is_call = outer_before is not None and (
-                    outer_before in {")", "]"} or (_IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
+                    outer_before in {")", "]"}
+                    or (_IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
                 )
                 if not is_call:
                     outer_after = toks[null_idx + 2][0] if null_idx + 2 < n else None
@@ -727,19 +758,21 @@ class AddressOfIndexToOffset(Transform):
     _BLOCK_AFTER = frozenset({".", "->", "(", "[", "++", "--"})
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        toks = ctokenize(code)
         n = len(toks)
         edits: list[tuple[int, int, str]] = []
         i = 0
         while i + 4 < n:
             if toks[i][0] == "&" and _IDENT.fullmatch(toks[i + 1][0]) and toks[i + 2][0] == "[":
-                close = _match_delim(toks, i + 2)
+                close = match_delimiter(toks, i + 2)
                 prev = toks[i - 1][0] if i > 0 else None
                 # `&` is binary (bitwise-and) only after a value: a non-keyword
                 # identifier, a number, or a closing `)`/`]`. After a keyword
                 # (`return`), an operator, or `(`/`,`/`;` it is unary address-of.
                 is_value = prev is not None and (
-                    prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT.fullmatch(prev) and prev not in _RESERVED)
+                    prev in self._VALUE_BEFORE
+                    or CNUMBER.fullmatch(prev)
+                    or (_IDENT.fullmatch(prev) and prev not in _RESERVED)
                 )
                 unary = not is_value
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
@@ -792,12 +825,15 @@ class StripPointerSlotAddress(Transform):
             m = self._RX.match(name)
             if m:
                 by_stripped.setdefault(m.group(1), []).append(name)
-        mapping = {origs[0]: stripped for stripped, origs in by_stripped.items() if len(origs) == 1 and stripped not in names}
+        mapping = {
+            origs[0]: stripped for stripped, origs in by_stripped.items() if len(origs) == 1 and stripped not in names
+        }
         if not mapping:
             return code
         big = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in mapping) + r")\b")
         return "".join(
-            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text) for seg_type, text in segments
+            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text)
+            for seg_type, text in segments
         )
 
 
@@ -819,4 +855,6 @@ class TrimPieceAccessSuffix(Transform):
     _RX = re.compile(r"((?:\.|->)\s*_[0-9a-fA-F]+_[0-9a-fA-F]+)_(?!\w)")
 
     def apply(self, code: str) -> str:
-        return "".join((self._RX.sub(r"\1", text) if seg_type == SegmentType.CODE else text) for seg_type, text in scan(code))
+        return "".join(
+            (self._RX.sub(r"\1", text) if seg_type == SegmentType.CODE else text) for seg_type, text in scan(code)
+        )

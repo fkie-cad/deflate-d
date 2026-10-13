@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated.transforms import CanonicalizeControlFlow
 
 
@@ -50,3 +52,35 @@ class TestCanonicalizeControlFlow:
         c = CanonicalizeControlFlow()
         out = c.apply("void *p = &&L1; L1: x = 1; goto *p;")
         assert "L1:" in out
+
+    def test_dead_goto_before_several_labels_removed(self) -> None:
+        # `goto A;` falls through to `A:` even with another label in between.
+        out = CanonicalizeControlFlow().apply("goto A; B: A: x = 1;")
+        assert "goto" not in out and ":" not in out and "x = 1;" in out
+
+    def test_chain_of_dead_gotos_removed(self) -> None:
+        # Once `goto B;` is gone, `goto A;` is directly followed by `B: A:` and is dead too.
+        out = CanonicalizeControlFlow().apply("goto A; goto B; B: A: x = 1;")
+        assert "goto" not in out and ":" not in out and "x = 1;" in out
+
+    def test_every_unused_label_removed(self) -> None:
+        # `B:` is unused even though it is not the first label of its statement.
+        out = CanonicalizeControlFlow().apply("A: B: y = 1; goto A;")
+        assert "B:" not in out and "A: y = 1;" in out
+
+    def test_goto_to_later_label_kept(self) -> None:
+        # `A:` is not in front of the next statement, so the goto skips `x = 1;` and must stay.
+        out = CanonicalizeControlFlow().apply("goto A; B: x = 1; A: y = 2;")
+        assert "goto A;" in out and "A:" in out
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "void f(void) {\n  goto A;\nB:\nA:\n  x = 1;\n}\n",
+            "void f(void) {\n  goto A;\n  goto B;\nB:\nA:\n  x = 1;\n}\n",
+            "void f(void) {\n  goto A;\nB:\n  goto C;\nC:\nA:\n  x = 1;\n}\n",
+        ],
+    )
+    def test_one_pass_reaches_fixed_point(self, src) -> None:
+        once = CanonicalizeControlFlow().apply(src)
+        assert CanonicalizeControlFlow().apply(once) == once

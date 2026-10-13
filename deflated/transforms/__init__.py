@@ -21,7 +21,7 @@ from .cosmetic import (
     TightenCommentSpaces,
     TightenWhitespace,
 )
-from .pipeline import Pipeline, ORDERED_TRANSFORMS, build_pipeline, transform
+from .pipeline import ORDERED_TRANSFORMS, Pipeline, build_pipeline, transform
 from .reductive import (
     DropCodePointerCast,
     DropCrtFunctions,

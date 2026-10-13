@@ -1,68 +1,54 @@
-"""T2 --- structural, lossless transforms.
+"""
+T2 structural transforms: shorter equivalent statements and expressions, so all of them are semantics-preserving.
 
-Information-preserving rewrites: nothing the model could use is removed, but the
-rendering gets smaller.
+No pass changes the inside of a string or char literal. Comments are only changed by `RemoveComments`, which deletes
+the auto-generated ones. The passes work on the segments from `scan`, the statements from `split_statements` or the
+tokens from `ctokenize`, which all keep literals and comments whole. The passes have no type information, so a pass
+skips any rewrite it cannot prove safe. A missed rewrite only costs size; a wrong one changes the program.
 """
 
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from itertools import groupby
+from typing import DefaultDict, Dict, List, Optional, Set, Tuple
 
 from .base import Tier, Transform
 from .ctokens import (
     CINT,
     CNUMBER,
     CToken,
-    ctokenize as _tok_offsets,
-    has_top_level_token as _has_top_level_token,
-    match_delimiter as _match_delim,
-    split_statements as _split_statements,
-    word_before as _word_before,
+    ctokenize,
+    has_top_level_token,
+    match_delimiter,
+    split_statements,
+    word_before,
 )
 from .lexer import SegmentType, scan, strip_comments
 
-# Keywords whose first word introduces a control statement (so a block body
-# beginning with one is *not* a single simple statement) ...
+# Keywords that start a control statement, so a block body starting with one is not a single simple statement.
 _CTRL_KW = frozenset({"if", "for", "while", "do", "switch", "else"})
-# ... and statement keywords that are not types, so a sole `<kw> ...;` body must
-# never be mistaken for a declaration.
-_STMT_KW = frozenset({"return", "goto", "break", "continue", "case", "default", "sizeof", "typedef"})
-# A local declaration -- bare (`int x;`), array (`int x[3];`), or *initialized*
-# (`int x = 1;`). The leading `type [*]name` shape (two-plus identifier words,
-# the last being the declared name) is what separates a declaration from an
-# assignment (`x = 1;`) or any other expression statement, which never begin
-# `<word> <word>`. Array dimensions and an initializer are both optional.
+
+# Statement keywords that are not types, so `<kw> ...;` is never read as a declaration. The C++ ones matter too:
+# `delete p;` has the `type name;` shape.
+_STMT_KW = frozenset(
+    {"return", "goto", "break", "continue", "case", "default", "sizeof", "typedef"}
+    | {"delete", "throw", "new", "co_return", "co_yield", "co_await", "using", "namespace"}
+)
+
+# A local declaration: `int x;`, `int x[3];` or `int x = 1;`. It starts with two or more words (`type [*]name`), which
+# an assignment or any other expression statement never does.
 _DECL = re.compile(r"^[A-Za-z_][A-Za-z0-9_ ]*\s+\**[A-Za-z_]\w*(?:\s*\[[^\];]*\])*\s*(?:=[^;]*)?;$")
 
-# Binary operators that have a compound-assignment form (a = a OP b -> a OP= b).
+# Binary operators with a compound-assignment form (`a = a OP b` -> `a OP= b`).
 _COMPOUND_OPS = frozenset("+ - * / % & | ^ << >>".split())
 
+# One leading goto label such as `LABEL_3:` (not C++ `::`); group 1 is its name.
+_LABEL_PREFIX = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*")
 
-# A single leading goto-label prefix, e.g. ``LABEL_3:`` (but not C++ ``::``).
-_LABEL_PREFIX = re.compile(r"\s*[A-Za-z_]\w*\s*:(?!:)\s*")
-
-
-def _split_leading_labels(s: str) -> tuple[str, str]:
-    """Split ``s`` into its run of leading ``label:`` prefixes and the remainder.
-
-    ``"L1: L2: x = 1;"`` -> ``("L1: L2: ", "x = 1;")``. ``case``/``default``
-    labels are left attached (they are not plain goto-labels), so a ``switch``
-    body is never mis-split.
-    """
-    i = 0
-    while (m := _LABEL_PREFIX.match(s, i)) and s[i : m.end()].strip().rstrip(":").strip() not in ("default", "case"):
-        i = m.end()
-    return s[:i], s[i:]
-
-
-def _strip_leading_labels(s: str) -> str:
-    """Return ``s`` with any leading goto-labels removed (see _split_leading_labels)."""
-    return _split_leading_labels(s)[1]
-
-
-# C binary-operator precedence (smaller binds tighter). Used to verify that
-# folding `a = a OP rest` -> `a OP= rest` does not silently re-group the
-# right-hand side (which would change the result for non-associative OPs).
+# C binary-operator precedence (smaller binds tighter). `compound-assign` uses it to check that `a = a OP rest` ->
+# `a OP= rest` does not regroup `rest`.
 _PRECEDENCE = {
     "*": 3,
     "/": 3,
@@ -86,67 +72,79 @@ _PRECEDENCE = {
     ":": 13,
     ",": 14,
 }
-# OPs whose repeated application is associative *for every operand type they
-# accept*, so a same-precedence chain `a OP b OP c` may still fold. Only the
-# bitwise operators qualify: they apply solely to integers, where they are exactly
-# associative. `+`/`*` are deliberately excluded: although associative on integers
-# (mod 2^n), they also apply to floating-point, where reassociating `(a+b)+c` into
-# `a+(b+c)` changes the rounded result --- and this text-local pass cannot tell a
-# float lvalue from an int one, so it must refuse the chain to stay lossless.
-# (Single-term `a = a + b` -> `a += b` and tighter-binding `a = a + b*c` are
-# unaffected: neither reassociates.)
+
+# Operators that may repeat in a folded chain `a = a OP b OP c`, because they are associative for every operand type.
+# Only the bitwise ones qualify. `+` and `*` also apply to floats, where `(a+b)+c` and `a+(b+c)` round differently, and
+# the pass cannot tell a float from an int. `a = a + b` and `a = a + b*c` still fold: neither regroups.
 _ASSOCIATIVE_OPS = frozenset({"&", "|", "^"})
 
 
-def _looks_like_decl(s: str, first: str) -> bool:
-    """True if ``s`` is a local declaration (illegal as a control sub-statement)."""
-    if first in _CTRL_KW or first in _STMT_KW:
+def _split_leading_labels(statement: str) -> Tuple[str, str]:
+    """
+    Split `statement` into its leading `label:` prefixes and the rest: `"L1: L2: x = 1;"` -> `("L1: L2: ", "x = 1;")`.
+
+    `case` and `default` labels stay attached, so a `switch` body is never split.
+    """
+    prefix_length = 0
+    while (label_match := _LABEL_PREFIX.match(statement, prefix_length)) is not None and label_match.group(1) not in (
+        "case",
+        "default",
+    ):
+        prefix_length = label_match.end()
+    return statement[:prefix_length], statement[prefix_length:]
+
+
+def _strip_leading_labels(statement: str) -> str:
+    """Return `statement` without its leading goto labels (see `_split_leading_labels`)."""
+    return _split_leading_labels(statement)[1]
+
+
+def _squash(text: str) -> str:
+    """Return `text` without whitespace, so `char *` and `char*` compare equal."""
+    return re.sub(r"\s+", "", text)
+
+
+def _looks_like_decl(statement: str, first_word: str) -> bool:
+    """
+    True if `statement`, whose first word is `first_word`, is a local declaration, which C does not allow as a control
+    body.
+    """
+    if first_word in _CTRL_KW or first_word in _STMT_KW:
         return False
-    return bool(_DECL.match(s))
+    return bool(_DECL.match(statement))
 
 
 class NormalizeFlagTemps(Transform):
-    r"""Normalize Binary Ninja's colon-spelled flag temporaries to plain identifiers.
+    """
+    Rename Binary Ninja's flag temporaries from `cond:N` to `condN` (also `cond:12_1` -> `cond12_1`), in code only.
 
-    Binary Ninja names a lifted condition-flag SSA value with a colon
-    (``cond:0``, ``cond:12_1``) --- the only place ``:`` appears inside what is
-    otherwise an identifier, and not legal C. The colon makes it a token the rest
-    of the pipeline can misread: a statement-leading ``cond:1 = ...`` looks like a
-    goto label ``cond:`` to ``cfg-canon``, which would drop it and orphan the
-    assignment. We therefore rewrite ``cond:N`` -> ``condN`` (CODE only) *first*,
-    before any structural pass inspects the text; the rewrite only drops a
-    non-C separator from one synthesized identifier, so it is information-
-    preserving (T2). The matching ``cond\d+`` placeholder in ``compress-names``
-    then compresses the normalized name at T3 like any other flag temp.
-
-    Runs at the head of the pipeline (before ``cfg-canon``/``ternary``) so the
-    colon never reaches a pass that could misinterpret it.
+    The `:` is not legal C, and a statement starting with `cond:1 = ...` looks like the goto label `cond:` to
+    `cfg-canon`, which would drop it. The pass runs first, so no later pass sees the colon. At T3 `compress-names`
+    shortens `condN` like any other flag temporary.
     """
 
     id = "flag-temps"
     tier = Tier.T2_STRUCTURAL
     description = "Normalize Binary Ninja colon-flag temporaries into plain identifiers."
 
-    _RX = re.compile(r"\bcond:(\d+(?:_\d+)?)")
+    _FLAG_TEMP = re.compile(r"\bcond:(\d+(?:_\d+)?)")
 
     def apply(self, code: str) -> str:
-        return "".join((self._RX.sub(r"cond\1", t) if seg_type == SegmentType.CODE else t) for seg_type, t in scan(code))
+        """Return `code` with every `cond:N` in code renamed to `condN`."""
+        return "".join(
+            (self._FLAG_TEMP.sub(r"cond\1", text) if seg_type == SegmentType.CODE else text)
+            for seg_type, text in scan(code)
+        )
 
 
 class RemoveComments(Transform):
-    """Remove auto-generated line and block comments, *except* warning banners.
+    """
+    Remove auto-generated comments, but keep decompiler warning banners.
 
-    Address annotations (``/* 0x4011a0 */``) and Hex-Rays' per-variable
-    storage-location notes (``// rax``, ``// [rsp+8h]``, ``BYREF``) are both
-    decompiler-recovered location/provenance metadata: invisible to program
-    semantics and irrelevant to our tasks, so removing them is lossless here,
-    even though each is signal for some low-level analysis (addresses for binary
-    diffing or trace correlation, the location notes for ABI/calling-convention
-    recovery; see the Threats discussion). Decompiler *warning* banners
-    (``/* WARNING: Could not recover jumptable... */``) are different --- they
-    signal that the decompilation is unreliable here, which is genuine analyst
-    signal --- so they are preserved at this tier and only dropped by
-    :class:`RemoveWarningComments` at T4. String-safe via the scanner.
+    Address comments (`/* 0x4011a0 */`) and Hex-Rays' storage-location notes (`// rax`, `// [rsp+8h]`, `BYREF`) say
+    nothing about what the program does, so removing them is lossless for our tasks (they would still help binary
+    diffing or ABI recovery). Warning banners (`/* WARNING: Could not recover jumptable... */`) say the decompilation
+    is unreliable, so they stay until `RemoveWarningComments` at T4.
     """
 
     id = "comments"
@@ -154,37 +152,26 @@ class RemoveComments(Transform):
     description = "Remove auto-generated address and storage-location comments, keeping warning banners."
 
     def apply(self, code: str) -> str:
+        """Return `code` without its auto-generated comments."""
         return strip_comments(code, keep_warnings=True)
 
 
 class CoalesceDeclarations(Transform):
-    """Consolidate same-type local declarations across a declaration region.
+    """
+    Merge the uninitialized declarations of one type in a run of declarations into one statement per type.
 
-    Within a maximal run of consecutive uninitialized declaration statements,
-    declarators are grouped by type and emitted as one statement per type ---
-    even when the same type is non-adjacent, e.g.
-
-        int iVar1; ulong uVar2, uVar3; int iVar4;
-        ->  int iVar1, iVar4; ulong uVar2, uVar3;
-
-    Safety: only *uninitialized* declarators (optional ``*``s plus a plain
-    identifier) are consolidated. They have no initializer, hence no side
-    effects and no dependence on declaration order, so regrouping them is
-    strictly lossless. Initialized *definitions* (``int x = f();``), arrays, and
-    function pointers are left untouched --- reordering a side-effecting
-    initializer is unsafe without a full parser. Keyword-led statements
-    (``goto h;``, ``return iVar1;``) are explicitly excluded.
+    The same type need not be adjacent: `int iVar1; ulong uVar2, uVar3; int iVar4;` -> `int iVar1, iVar4; ulong uVar2,
+    uVar3;`. Only plain declarators (`*`s and a name) are merged: without an initializer, their order does not matter.
+    Initialized declarations (`int x = f();`), arrays and function pointers are left alone.
     """
 
     id = "decl-coalesce"
     tier = Tier.T2_STRUCTURAL
     description = "Merge same-type uninitialized declarations into one statement."
 
-    # A consolidatable declaration: type, then a comma-list of uninitialized
-    # declarators (each an optional run of '*' before a plain identifier). The
-    # trailing ';' anchors the last declarator so the non-greedy type absorbs
-    # multi-word types ("unsigned int") unambiguously. '=', '[', '(' are
-    # excluded, so initializers / arrays / function pointers never match.
+    # A mergeable declaration: a type, a comma list of declarators (`*`s and a name), then `;`. The `;` anchors the
+    # last declarator, so the lazy type takes multi-word types (`unsigned int`). `=`, `[` and `(` never match, so
+    # initializers, arrays and function pointers are excluded.
     _DECL = re.compile(
         r"^(?P<lead>\s*)"
         r"(?P<type>[A-Za-z_][A-Za-z0-9_ ]*?)[ \t]+"
@@ -192,81 +179,61 @@ class CoalesceDeclarations(Transform):
         r"[ \t]*;[ \t]*$"
     )
 
-    # First-word "types" that actually introduce a statement, not a declaration.
-    _NON_TYPES = frozenset("return goto break continue case default sizeof typedef " "do else while for if switch".split())
+    # First words that start a statement, not a type.
+    _NON_TYPES = _STMT_KW | _CTRL_KW
 
-    def _match_decl(self, piece: str) -> re.Match | None:
-        m = self._DECL.match(piece)
-        if m and m.group("type").split()[0] in self._NON_TYPES:
+    def _match_decl(self, piece: str) -> Optional[re.Match]:
+        """Return the match if `piece` is a mergeable declaration whose first word is not a keyword, else None."""
+        decl_match = self._DECL.match(piece)
+        if decl_match and decl_match.group("type").split()[0] in self._NON_TYPES:
             return None
-        return m
+        return decl_match
 
     def apply(self, code: str) -> str:
-        pieces = _split_statements(code)
-        out: list[str] = []
-        i, n = 0, len(pieces)
-        while i < n:
-            m = self._match_decl(pieces[i])
-            if not m:
-                out.append(pieces[i])
-                i += 1
-                continue
-            run = [m]
-            j = i + 1
-            while j < n:
-                mj = self._match_decl(pieces[j])
-                if not mj:
-                    break
-                run.append(mj)
-                j += 1
-            out.append(self._consolidate(run, pieces[i:j]))
-            i = j
-        return "".join(out)
+        """Return `code` with every run of declarations merged into one statement per type."""
+        pieces = split_statements(code)
+        decl_matches = [self._match_decl(piece) for piece in pieces]
+        transformed_pieces: List[str] = []
+        for is_decl_run, group in groupby(zip(pieces, decl_matches), key=lambda pair: pair[1] is not None):
+            run_pieces, run_matches = zip(*group)
+            if is_decl_run:
+                transformed_pieces.append(self._consolidate(list(run_matches), list(run_pieces)))
+            else:
+                transformed_pieces.extend(run_pieces)
+        return "".join(transformed_pieces)
 
     @staticmethod
-    def _consolidate(run: list[re.Match], originals: list[str]) -> str:
-        groups: dict[str, list[str]] = {}
-        order: list[str] = []
-        for m in run:
-            btype = re.sub(r"\s+", " ", m.group("type").strip())
-            decls = [re.sub(r"\s+", "", d) for d in m.group("decls").split(",")]
-            if btype not in groups:
-                groups[btype] = []
-                order.append(btype)
-            groups[btype].extend(decls)
-        if len(order) == len(run):  # nothing merges; leave the run verbatim
-            return "".join(originals)
-        lead = run[0].group("lead")
-        sep = lead if "\n" in lead else " "
-        stmts = [f"{t} {', '.join(groups[t])};" for t in order]
-        return lead + sep.join(stmts)
+    def _consolidate(run_matches: List[re.Match], original_declarations: List[str]) -> str:
+        """
+        Return the declarations of `run` merged into one statement per type, or `originals` unchanged if no two of them
+        share a type.
+        """
+        declarators_by_type: DefaultDict[str, List[str]] = defaultdict(list)
+        for decl_match in run_matches:
+            type_name = re.sub(r"\s+", " ", decl_match.group("type").strip())
+            declarators = [re.sub(r"\s+", "", declarator) for declarator in decl_match.group("decls").split(",")]
+            declarators_by_type[type_name].extend(declarators)
+        if len(declarators_by_type) == len(run_matches):  # nothing merges; leave the run verbatim
+            return "".join(original_declarations)
+        indent = run_matches[0].group("lead")
+        separator = indent if "\n" in indent else " "
+        merged = [f"{type_name} {', '.join(declarators)};" for type_name, declarators in declarators_by_type.items()]
+        return indent + separator.join(merged)
 
 
 class DropSingleStatementBraces(Transform):
-    """Remove the braces of a control block that holds one simple statement.
+    """
+    Remove the braces of a control block that holds one simple statement: `if (c) { x = 1; }` -> `if (c) x = 1;`.
 
-    ``if (c) { x = 1; }`` -> ``if (c) x = 1;`` (and likewise for ``else``,
-    ``for``, ``while``, ``do``). The braces are pure punctuation here, so the
-    rewrite is lossless. Three safety traps are handled explicitly:
+    Works for `if`, `else`, `for`, `while` and `do`. These blocks keep their braces:
 
-    * **Only control blocks.** A ``{`` is stripped only when it opens an
-      ``if/for/while/switch`` (matched ``(...)`` preceded by the keyword),
-      ``else``, or ``do``. Function bodies, struct/enum bodies, array and
-      compound-literal initializers, and naked scope blocks are left intact ---
-      stripping their braces would be invalid or change scope.
+    * Other blocks: function, struct and enum bodies, initializers, plain scope blocks and `switch` bodies.
+    * A body that starts with a control keyword: in `if (a) { if (b) f(); } else g();` the `else` would move to the
+      inner `if`.
+    * A body that is a declaration: `if (c) int x;` is not valid C.
 
-    * **Dangling ``else``.** The body must be a single *simple* statement that
-      does not itself begin with a control keyword, so a brace-wrapped inner
-      ``if`` (``if (a) { if (b) f(); } else g();``) is never unwrapped and the
-      ``else`` cannot re-bind.
-
-    * **Sole declarations.** ``if (c) { int x; }`` keeps its braces, since
-      ``if (c) int x;`` is not valid C.
-
-    Strippable blocks contain no nested braces by construction, so every pair
-    found in one scan is disjoint; we apply them right-to-left and iterate to a
-    fixed point. Runs through the scanner, so braces inside literals/comments are
-    never touched.
+    Strippable blocks never contain braces, so all pairs from one scan are disjoint and are removed right to left in
+    a single pass.
     """
 
     id = "brace-elision"
@@ -274,121 +241,116 @@ class DropSingleStatementBraces(Transform):
     description = "Drop braces around a single-statement control block (if/else/for/while/do)."
 
     def apply(self, code: str) -> str:
-        for _ in range(64):  # bounded fixed-point; one pass usually suffices
-            pairs = self._strippable_pairs(code)
-            if not pairs:
-                break
-            for o, c in sorted(pairs, reverse=True):
-                # Replace each brace with a space so neighbours never merge
-                # (e.g. ``else{`` -> ``else `` not ``elsex``).
-                code = code[:o] + " " + code[o + 1 : c] + " " + code[c + 1 :]
+        """
+        Return `code` with the braces of every strippable control block replaced by spaces.
+        """
+        # One pass is enough: unwrapping an inner block never makes the outer one strippable, since the outer body then
+        # starts with a control keyword.
+        for open_offset, close_offset in sorted(self._strippable_pairs(code), reverse=True):
+            # Replace each brace with a space so its neighbours cannot merge: `else{x` must not become `elsex`.
+            code = code[:open_offset] + " " + code[open_offset + 1 : close_offset] + " " + code[close_offset + 1 :]
         return code
 
-    def _strippable_pairs(self, code: str) -> list[tuple[int, int]]:
-        # Non-whitespace code characters with their original offsets (strings
-        # and comments are skipped, so their braces are invisible here).
-        sig: list[str] = []
-        idx: list[int] = []
-        pos = 0
+    def _strippable_pairs(self, code: str) -> List[Tuple[int, int]]:
+        """
+        Return the offsets of the `{` and `}` of every control block that holds one simple statement.
+        """
+        # Non-whitespace code characters and their offsets. Strings and comments are skipped, so their braces are
+        # ignored.
+        characters: List[str] = []
+        offsets: List[int] = []
+        offset = 0
         for seg_type, text in scan(code):
             if seg_type == SegmentType.CODE:
-                for ch in text:
-                    if not ch.isspace():
-                        sig.append(ch)
-                        idx.append(pos)
-                    pos += 1
+                for character in text:
+                    if not character.isspace():
+                        characters.append(character)
+                        offsets.append(offset)
+                    offset += 1
             else:
-                pos += len(text)
+                offset += len(text)
 
-        stack: list[int] = []
-        result: list[tuple[int, int]] = []
-        for m, ch in enumerate(sig):
-            if ch == "{":
-                stack.append(m)
-            elif ch == "}" and stack:
-                om = stack.pop()
-                if not self._is_control_block(sig, om):
+        open_indices: List[int] = []
+        pairs: List[Tuple[int, int]] = []
+        for index, character in enumerate(characters):
+            if character == "{":
+                open_indices.append(index)
+            elif character == "}" and open_indices:
+                open_index = open_indices.pop()
+                if not self._is_control_block(characters, open_index):
                     continue
-                o, c = idx[om], idx[m]
-                if self._single_simple(code[o + 1 : c]):
-                    result.append((o, c))
-        return result
+                open_offset, close_offset = offsets[open_index], offsets[index]
+                if self._single_simple(code[open_offset + 1 : close_offset]):
+                    pairs.append((open_offset, close_offset))
+        return pairs
 
     @staticmethod
-    def _is_control_block(sig: list[str], m: int) -> bool:
-        """True if ``sig[m] == '{'`` opens a control-flow block."""
-        if m == 0:
+    def _is_control_block(characters: List[str], brace_index: int) -> bool:
+        """
+        True if the `{` at `characters[brace_index]` opens a control block.
+        """
+        if brace_index == 0:
             return False
-        if sig[m - 1] == ")":
-            depth, k = 0, m - 1
-            while k >= 0:
-                if sig[k] == ")":
+        if characters[brace_index - 1] == ")":
+            depth, paren_index = 0, brace_index - 1
+            while paren_index >= 0:
+                if characters[paren_index] == ")":
                     depth += 1
-                elif sig[k] == "(":
+                elif characters[paren_index] == "(":
                     depth -= 1
                     if depth == 0:
                         break
-                k -= 1
-            if k < 0:
+                paren_index -= 1
+            if paren_index < 0:
                 return False
-            # ``sig`` has no whitespace, so an ``else if`` controlling clause
-            # reads back as the single word ``elseif`` -- treat it as ``if`` so
-            # ``else if (c) { stmt; }`` is unwrapped like a plain ``if``.
-            # ``switch`` is deliberately excluded: a switch body carrying a
-            # ``case``/``default`` label needs its braces (``switch(x)case 1:...``
-            # is invalid C), and ``_single_simple`` keeps the label attached, so a
-            # one-statement switch body would otherwise be unwrapped to invalid C.
-            return _word_before(sig, k) in {"if", "for", "while", "elseif"}
-        return _word_before(sig, m) in {"else", "do"}
+            # `characters` has no whitespace, so `else if` reads as `elseif`, which is treated like `if`. `switch` is
+            # left out: a body with a `case` label needs its braces (`switch(x)case 1:...` is invalid C), and
+            # `_single_simple` keeps labels attached.
+            return word_before(characters, paren_index) in {"if", "for", "while", "elseif"}
+        return word_before(characters, brace_index) in {"else", "do"}
 
     @staticmethod
     def _single_simple(body: str) -> bool:
-        code_only = "".join(t for seg_type, t in scan(body) if seg_type == SegmentType.CODE)
+        """
+        True if `body` is one statement that is neither a control statement nor a declaration.
+        """
+        code_only = "".join(text for seg_type, text in scan(body) if seg_type == SegmentType.CODE)
         if "{" in code_only or "}" in code_only:
             return False
-        s = code_only.strip()
-        if not s:
+        statement = code_only.strip()
+        if not statement:
             return False
-        depth = semis = 0
-        semi_end = False
-        last = len(s) - 1
-        for i, ch in enumerate(s):
-            if ch in "([":
+        depth = semicolons = 0
+        ends_with_semicolon = False
+        last_index = len(statement) - 1
+        for index, character in enumerate(statement):
+            if character in "([":
                 depth += 1
-            elif ch in ")]":
+            elif character in ")]":
                 depth = max(0, depth - 1)
-            elif ch == ";" and depth == 0:
-                semis += 1
-                semi_end = i == last
-        if semis != 1 or not semi_end:
+            elif character == ";" and depth == 0:
+                semicolons += 1
+                ends_with_semicolon = index == last_index
+        if semicolons != 1 or not ends_with_semicolon:
             return False
-        # Look past any leading goto-labels (`LABEL_3: if (b) ...;`) to the real
-        # first token. Otherwise the label name is read as ``first`` and a labeled
-        # inner control statement slips past the dangling-else guard below, so its
-        # protective braces are dropped and an outer ``else`` re-binds to it.
-        s_kw = _strip_leading_labels(s)
-        mw = re.match(r"[A-Za-z_]\w*", s_kw)
-        first = mw.group(0) if mw else ""
-        if first in _CTRL_KW:
+        # Skip leading goto labels (`LABEL_3: if (b) ...;`) to find the first real word. Otherwise a labeled inner `if`
+        # would pass the dangling-else check, lose its braces, and an outer `else` would bind to it.
+        unlabeled = _strip_leading_labels(statement)
+        word_match = re.match(r"[A-Za-z_]\w*", unlabeled)
+        first_word = word_match.group(0) if word_match else ""
+        if first_word in _CTRL_KW:
             return False
-        return not _looks_like_decl(s_kw, first)
+        return not _looks_like_decl(unlabeled, first_word)
 
 
 class CompoundAssignment(Transform):
-    """Fold ``a = a OP b;`` into ``a OP= b;`` for the compound-capable operators.
+    """
+    Fold `a = a OP b;` into `a OP= b;` (`iVar1 = iVar1 + iVar4;` -> `iVar1 += iVar4;`).
 
-    Decompilers emit the expanded form pervasively (``iVar1 = iVar1 + iVar4;``,
-    ``uVar3 = uVar3 + 1;``); the compound form is identical in meaning whenever
-    the left-hand side is evaluated only once to the same effect.
-
-    Safety. The transform matches by *token sequence*, not string equality, so
-    the left operand of the right-hand side must be the exact same token list as
-    the assignment target --- ``a->b`` (token ``->``) and ``a + +b`` (two ``+``
-    tokens) can never be misread as ``a`` followed by an operator. The target
-    must also be a *pure* lvalue: no ``++``/``--`` and no function call, so
-    evaluating it once (compound form) rather than twice (expanded form) cannot
-    change behaviour. Address arithmetic without side effects
-    (``*(int *)(p + i * 4)``) is therefore eligible, but ``*p++`` is not.
+    The right side must start with exactly the tokens of the target, so `a->b` or `a + +b` is never read as `a`
+    followed by an operator. The target is evaluated once instead of twice, so it may not contain `++`, `--` or a
+    call: `*(int *)(p + i * 4)` folds, `*p++` does not. The rest of the right side must bind tighter than OP (see
+    `_remainder_safe`), since the fold regroups it.
     """
 
     id = "compound-assign"
@@ -396,108 +358,111 @@ class CompoundAssignment(Transform):
     description = "Fold an expanded assignment into compound form."
 
     def apply(self, code: str) -> str:
-        return "".join(self._rewrite(p) for p in _split_statements(code))
+        """
+        Return `code` with every foldable `a = a OP b;` written as `a OP= b;`.
+        """
+        return "".join(self._rewrite(piece) for piece in split_statements(code))
 
     def _rewrite(self, piece: str) -> str:
+        """
+        Return `piece` in compound form if it is a foldable `a = a OP b;`, else unchanged.
+        """
         stripped = piece.rstrip()
         if not stripped.endswith(";"):
             return piece
-        n_lead = len(piece) - len(piece.lstrip())
-        lead = piece[:n_lead]
-        trail = piece[len(stripped) :]
-        inner = stripped[n_lead:-1]  # statement text without leading ws or ';'
+        indent_length = len(piece) - len(piece.lstrip())
+        indent = piece[:indent_length]
+        trailing = piece[len(stripped) :]
+        statement = stripped[indent_length:-1]  # the statement without leading whitespace and `;`
 
-        # Set aside any leading goto labels so the assignment after them is
-        # reachable and the labels are preserved in place.
-        label, rest = _split_leading_labels(inner)
+        # Set leading goto labels aside and put them back in front of the result.
+        labels, assignment = _split_leading_labels(statement)
 
-        toks = _tok_offsets(rest)
-        i = self._assign_index(toks)
-        if i <= 0:  # no top-level '=' assignment, or nothing on the left
+        tokens = ctokenize(assignment)
+        assign_index = self._assign_index(tokens)
+        if assign_index <= 0:  # no top-level `=`, or nothing to its left
             return piece
-        lhs_tokens = [t for t, _, _ in toks[:i]]
-        if not self._pure_lvalue(lhs_tokens):
+        lhs_texts = [token.text for token in tokens[:assign_index]]
+        if not self._pure_lvalue(lhs_texts):
             return piece
 
-        rhs = toks[i + 1 :]
-        k = len(lhs_tokens)
-        if len(rhs) <= k or [t for t, _, _ in rhs[:k]] != lhs_tokens:
+        rhs_tokens = tokens[assign_index + 1 :]
+        lhs_length = len(lhs_texts)
+        if len(rhs_tokens) <= lhs_length or [token.text for token in rhs_tokens[:lhs_length]] != lhs_texts:
             return piece
-        op = rhs[k][0]
-        if op not in _COMPOUND_OPS:
+        operator = rhs_tokens[lhs_length].text
+        if operator not in _COMPOUND_OPS:
             return piece
-        if not self._remainder_safe(op, rhs[k + 1 :]):
+        if not self._remainder_safe(operator, rhs_tokens[lhs_length + 1 :]):
             return piece
-        remainder = rest[rhs[k][2] :].strip()
+        remainder = assignment[rhs_tokens[lhs_length].end :].strip()
         if not remainder:
             return piece
 
-        lhs_text = rest[: toks[i][1]].strip()
-        return f"{lead}{label}{lhs_text} {op}= {remainder};{trail}"
+        lhs = assignment[: tokens[assign_index].start].strip()
+        return f"{indent}{labels}{lhs} {operator}= {remainder};{trailing}"
 
     @staticmethod
-    def _remainder_safe(op: str, rem: list[CToken]) -> bool:
-        """True if ``a OP= rem`` preserves the meaning of ``a = a OP rem``.
+    def _remainder_safe(operator: str, remainder_tokens: List[CToken]) -> bool:
+        """
+        True if `a OP= rem` means the same as `a = a OP rem`, where OP is `operator` and rem is `remainder_tokens`.
 
-        Folding re-groups the right-hand side as ``a OP (rem)``. That is only
-        equivalent to the original left-associative evaluation when every
-        top-level binary operator in ``rem`` binds *tighter* than OP, or repeats
-        an associative OP. Operators that bind looser or equal (``a - b - c``,
-        ``a * b + c``) would change the result, so the fold is refused. A unary
-        operator (one not following an operand) is part of an operand and never
-        counts; ``->``/``.`` are not split operators either.
+        The fold regroups `a OP rem` as `a OP (rem)`. That is only the same if every top-level binary operator in `rem`
+        binds tighter than OP, or is OP itself and associative: `a - b - c` and `a * b + c` do not fold. A unary
+        operator (one not after an operand) belongs to its operand, and `->` and `.` are not split on.
         """
         depth = 0
-        prev_operand = False
-        for t, _, _ in rem:
-            if t in ("(", "[", "{"):
+        after_operand = False
+        for token in remainder_tokens:
+            if token.text in ("(", "[", "{"):
                 depth += 1
-                prev_operand = False
-            elif t in (")", "]", "}"):
+                after_operand = False
+            elif token.text in (")", "]", "}"):
                 depth -= 1
-                prev_operand = True
-            elif depth == 0 and prev_operand and t in _PRECEDENCE:
-                tighter = _PRECEDENCE[t] < _PRECEDENCE[op]
-                if not (tighter or (t == op and op in _ASSOCIATIVE_OPS)):
+                after_operand = True
+            elif depth == 0 and after_operand and token.text in _PRECEDENCE:
+                binds_tighter = _PRECEDENCE[token.text] < _PRECEDENCE[operator]
+                if not (binds_tighter or (token.text == operator and operator in _ASSOCIATIVE_OPS)):
                     return False
-                prev_operand = False
+                after_operand = False
             else:
-                prev_operand = True
+                after_operand = True
         return True
 
     @staticmethod
-    def _assign_index(toks: list[CToken]) -> int:
-        """Index of the first top-level plain ``=`` token, or -1."""
+    def _assign_index(tokens: List[CToken]) -> int:
+        """
+        Return the index of the first top-level `=` token, or -1.
+        """
         depth = 0
-        for idx, (t, _, _) in enumerate(toks):
-            if t in ("(", "[", "{"):
+        for index, token in enumerate(tokens):
+            if token.text in ("(", "[", "{"):
                 depth += 1
-            elif t in (")", "]", "}"):
+            elif token.text in (")", "]", "}"):
                 depth = max(0, depth - 1)
-            elif t == "=" and depth == 0:
-                return idx
+            elif token.text == "=" and depth == 0:
+                return index
         return -1
 
     @staticmethod
-    def _pure_lvalue(toks: list[str]) -> bool:
-        if not toks or "++" in toks or "--" in toks:
+    def _pure_lvalue(lhs_texts: List[str]) -> bool:
+        """
+        True if the target `lhs_texts` has no `++`, `--` or call, so evaluating it once instead of twice is the same.
+        """
+        if not lhs_texts or "++" in lhs_texts or "--" in lhs_texts:
             return False
-        for a, b in zip(toks, toks[1:]):
-            if b == "(" and re.fullmatch(r"[A-Za-z_]\w*", a):
-                return False  # identifier immediately followed by '(' -> a call
-        return toks[0] in ("*", "(") or bool(re.fullmatch(r"[A-Za-z_]\w*", toks[0]))
+        for left, right in zip(lhs_texts, lhs_texts[1:]):
+            if right == "(" and re.fullmatch(r"[A-Za-z_]\w*", left):
+                return False  # a name followed by `(` is a call
+        return lhs_texts[0] in ("*", "(") or bool(re.fullmatch(r"[A-Za-z_]\w*", lhs_texts[0]))
 
 
 class RedundantCastElision(Transform):
-    """Drop provably-redundant *duplicate* casts: ``(T)(T)x`` -> ``(T)x``.
+    """
+    Remove the outer one of two identical adjacent casts: `(T)(T)x` -> `(T)x`.
 
-    Decompilers occasionally stack a cast on top of an identical one. Casting a
-    value to ``T`` and then to ``T`` again is idempotent, so the outer copy is
-    removed. We only collapse two *adjacent, token-identical* casts whose type
-    is unambiguous (it contains a ``*`` or a recognised type keyword), so a
-    call-through-pointer such as ``(x)(x)`` --- which is not a cast --- is never
-    touched. General redundant-cast removal (e.g. a cast matching the operand's
-    inferred type) needs type information and is out of scope.
+    The type must contain a `*` or a known type word and must not start with `*`, so calls like `(x)(x)` and
+    `(*fp)(*fp)` are never touched. Other redundant casts (a cast to the operand's own type) need type information.
     """
 
     id = "cast-elision"
@@ -511,59 +476,60 @@ class RedundantCastElision(Transform):
     )
 
     def apply(self, code: str) -> str:
-        for _ in range(64):
-            toks = _tok_offsets(code)
-            cut = self._first_dup_cast(toks)
-            if cut is None:
-                break
-            lo, hi = cut
-            code = code[:lo] + code[hi:]
+        """
+        Return `code` with the outer cast of every identical cast pair removed.
+        """
+        # One tokenization is enough: removing `(T)` from `(A)(T)(T)` makes `(A)` touch the second `(T)`, but if `A` is
+        # `T` it was a duplicate already, so a chain `(T)(T)(T)x` loses all but the last cast here.
+        for start, end in reversed(self._dup_casts(ctokenize(code))):
+            code = code[:start] + code[end:]
         return code
 
-    def _first_dup_cast(self, toks: list[CToken]):
-        n = len(toks)
-        for i in range(n):
-            if toks[i][0] != "(":
+    def _dup_casts(self, tokens: List[CToken]) -> List[Tuple[int, int]]:
+        """
+        Offsets of every redundant cast `(T)` directly followed by `(T)`, left to right and non-overlapping.
+        """
+        cuts: List[Tuple[int, int]] = []
+        token_count = len(tokens)
+        for index in range(token_count):
+            if cuts and tokens[index].start < cuts[-1][1]:
                 continue
-            cp = _match_delim(toks, i)
-            if cp is None or cp + 1 >= n or toks[cp + 1][0] != "(":
+            if tokens[index].text != "(":
                 continue
-            cp2 = _match_delim(toks, cp + 1)
-            if cp2 is None:
+            first_close = match_delimiter(tokens, index)
+            if first_close is None or first_close + 1 >= token_count or tokens[first_close + 1].text != "(":
                 continue
-            g1 = [t[0] for t in toks[i + 1 : cp]]
-            g2 = [t[0] for t in toks[cp + 2 : cp2]]
-            if g1 and g1 == g2 and self._type_like(g1):
-                # Remove the first, redundant cast "(T)".
-                return toks[i][1], toks[cp][2]
-        return None
+            second_close = match_delimiter(tokens, first_close + 1)
+            if second_close is None:
+                continue
+            first_type = [token.text for token in tokens[index + 1 : first_close]]
+            second_type = [token.text for token in tokens[first_close + 2 : second_close]]
+            if first_type and first_type == second_type and self._type_like(first_type):
+                # The first `(T)` is the redundant one.
+                cuts.append((tokens[index].start, tokens[first_close].end))
+        return cuts
 
     @classmethod
-    def _type_like(cls, g: list[str]) -> bool:
-        if "," in g or "?" in g:
+    def _type_like(cls, type_texts: List[str]) -> bool:
+        """
+        True if the token texts `type_texts` inside a `(...)` group can only be a type.
+        """
+        # A type never starts with `*`; `(*fp)` is a dereferenced function pointer.
+        if type_texts[0] == "*" or "," in type_texts or "?" in type_texts:
             return False
-        return "*" in g or any(t in cls._TYPE_WORDS for t in g)
+        return "*" in type_texts or any(text in cls._TYPE_WORDS for text in type_texts)
 
 
 class InlineSingleUseTemps(Transform):
-    """Inline a spill temporary whose only use is the next ``return``.
+    """
+    Inline a temporary whose only use is the next `return`: `uVar1 = f(); return uVar1;` -> `return f();`.
 
-    Decompilers spill a result into a one-shot variable and return it::
-
-        undefined8 uVar1;   // declaration
-        ...
-        uVar1 = f();        // sole assignment
-        return uVar1;       // sole use
-
-    We fold the adjacent ``uVar1 = f(); return uVar1;`` to ``return f();`` and
-    drop the now-dead declaration. The fold fires only when the name occurs
-    exactly as often as those roles account for --- assignment + return, plus an
-    optional single uninitialised declaration --- so it is provably used nowhere
-    else; and because the two statements are adjacent, the initializer keeps its
-    position and no evaluation is reordered (safe even if ``f()`` has side
-    effects). The whole-input count is deliberately conservative: a name reused
-    across functions blocks the fold rather than risking a wrong rewrite. Runs
-    before declaration coalescing so the dead declaration is still its own line.
+    The declaration `undefined8 uVar1;` is removed too. The fold only fires when the name occurs exactly as often as
+    the assignment, the return and at most one uninitialized declaration account for, counted over the whole input, so
+    a name reused in another function blocks it. The two statements are adjacent, so nothing is reordered even if
+    `f()` has side effects. The store converts to the temporary's type, so if that differs from the function's return
+    type the fold keeps it as a cast: `return (T)f();`. Runs before `decl-coalesce`, so the declaration is still its
+    own statement.
     """
 
     id = "inline-temps"
@@ -573,127 +539,259 @@ class InlineSingleUseTemps(Transform):
     _ASSIGN = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=\s*(.+);\s*$", re.S)
     _RETURN = re.compile(r"^\s*return\s+([A-Za-z_]\w*)\s*;(\s*)$", re.S)
     _DECL = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_ ]*\s+\**(?P<name>[A-Za-z_]\w*)\s*;\s*$")
+    # A function header `<return type> <name>(`; the return type is group 1.
+    _HEADER = re.compile(r"^\s*(.*?)\b[A-Za-z_]\w*\s*\(", re.S)
+    # Header words that are not part of the return type.
+    _HEADER_NOISE = frozenset({"static", "inline", "extern", "__cdecl", "__stdcall", "__fastcall", "__thiscall"})
 
     def apply(self, code: str) -> str:
-        counts: dict[str, int] = {}
+        """
+        Return `code` with every single-use temporary inlined into its `return`.
+        """
+        name_counts: Dict[str, int] = {}
         for seg_type, text in scan(code):
             if seg_type == SegmentType.CODE:
-                for m in re.finditer(r"[A-Za-z_]\w*", text):
-                    counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+                for name_match in re.finditer(r"[A-Za-z_]\w*", text):
+                    name_counts[name_match.group(0)] = name_counts.get(name_match.group(0), 0) + 1
 
-        pieces = _split_statements(code)
-        n = len(pieces)
-        keep = [True] * n
+        pieces = split_statements(code)
+        piece_count = len(pieces)
+        keep = [True] * piece_count
 
-        # Standalone single-declarator declarations, by declared name. The
-        # leading word must be a real type, not a statement keyword (otherwise
-        # `return x;` would parse as a declaration of `x`).
-        decls: dict[str, list[int]] = {}
-        for idx, p in enumerate(pieces):
-            md = self._DECL.match(p)
-            # A `volatile` temp's store-then-load is observable, so leave it: not
-            # tracking the declaration makes the use-count mismatch and blocks the
-            # fold (the variable is preserved rather than inlined away).
-            if md and p.split()[0] not in (_STMT_KW | _CTRL_KW) and "volatile" not in p.split():
-                decls.setdefault(md.group("name"), []).append(idx)
+        # Single-name declarations by name. The first word must not be a keyword, or `return x;` would declare `x`.
+        decl_indices_by_name: DefaultDict[str, List[int]] = defaultdict(list)
+        for index, piece in enumerate(pieces):
+            decl_match = self._DECL.match(piece)
+            # Storing to and loading from a `volatile` temp is observable. Not recording its declaration makes the use
+            # count wrong, which blocks the fold.
+            if decl_match and piece.split()[0] not in (_STMT_KW | _CTRL_KW) and "volatile" not in piece.split():
+                decl_indices_by_name[decl_match.group("name")].append(index)
 
-        i = 0
-        while i < n - 1:
-            ma = self._ASSIGN.match(pieces[i])
-            mr = self._RETURN.match(pieces[i + 1])
-            if keep[i] and keep[i + 1] and ma and mr and ma.group(2) == mr.group(1):
-                name, expr = ma.group(2), ma.group(3)
-                d = decls.get(name, [])
-                expected = 2 + (1 if len(d) == 1 else 0)
-                # Check for a self-reference in the initializer over CODE only, so
-                # the name appearing inside a string literal (`f("uVar1")`) does
-                # not spuriously block the fold (the counts above are CODE-only too).
-                expr_code = "".join(t for st, t in scan(expr) if st == SegmentType.CODE)
-                if counts.get(name, 0) == expected and len(d) <= 1 and not re.search(r"\b" + re.escape(name) + r"\b", expr_code):
-                    pieces[i] = f"{ma.group(1)}return {expr.strip()};{mr.group(2)}"
-                    keep[i + 1] = False
-                    if d:
-                        keep[d[0]] = False
-                    i += 2
+        index = 0
+        while index < piece_count - 1:
+            assign_match = self._ASSIGN.match(pieces[index])
+            return_match = self._RETURN.match(pieces[index + 1])
+            if (
+                keep[index]
+                and keep[index + 1]
+                and assign_match
+                and return_match
+                and assign_match.group(2) == return_match.group(1)
+            ):
+                name, expr = assign_match.group(2), assign_match.group(3)
+                decl_indices = decl_indices_by_name.get(name, [])
+                expected_count = 2 + (1 if len(decl_indices) == 1 else 0)
+                # Look for a self-reference in code only, like the counts above, so `f("uVar1")` does not block the
+                # fold.
+                expr_code = "".join(text for seg_type, text in scan(expr) if seg_type == SegmentType.CODE)
+                if (
+                    name_counts.get(name, 0) == expected_count
+                    and len(decl_indices) <= 1
+                    and not re.search(r"\b" + re.escape(name) + r"\b", expr_code)
+                ):
+                    value = expr.strip()
+                    if decl_indices:
+                        # The store into the temp converts to its type: keep that as a cast unless the function returns
+                        # the same type anyway.
+                        declaration = pieces[decl_indices[0]]
+                        temp_type = declaration[: self._DECL.match(declaration).start("name")].strip()
+                        return_type = self._return_type(code, sum(len(piece) for piece in pieces[:index]))
+                        if return_type is None or _squash(return_type) != _squash(temp_type):
+                            value = f"({temp_type}){self._as_operand(value)}"
+                    pieces[index] = f"{assign_match.group(1)}return {value};{return_match.group(2)}"
+                    keep[index + 1] = False
+                    if decl_indices:
+                        keep[decl_indices[0]] = False
+                    index += 2
                     continue
-            i += 1
-        return "".join(p for k, p in enumerate(pieces) if keep[k])
+            index += 1
+        return "".join(piece for index, piece in enumerate(pieces) if keep[index])
+
+    @classmethod
+    def _return_type(cls, code: str, offset: int) -> Optional[str]:
+        """
+        Return the declared return type of the function whose body contains `offset`, or None if not found.
+        """
+        depth, header_start = 0, 0
+        header: Optional[str] = None
+        for token in ctokenize(code):
+            if token.start >= offset:
+                break
+            if token.text == "{":
+                if depth == 0:
+                    header = code[header_start : token.start]
+                depth += 1
+            elif token.text == "}":
+                depth -= 1
+                if depth == 0:
+                    header_start, header = token.end, None
+            elif token.text == ";" and depth == 0:
+                header_start = token.end
+        if depth != 1 or header is None:
+            return None
+        header = "\n".join(line for line in strip_comments(header).splitlines() if not line.lstrip().startswith("#"))
+        header_match = cls._HEADER.match(header)
+        if header_match is None:
+            return None
+        words = [
+            word for word in re.split(r"(\W)", header_match.group(1)) if word.strip() and word not in cls._HEADER_NOISE
+        ]
+        return " ".join(words) or None
+
+    @staticmethod
+    def _as_operand(expr: str) -> str:
+        """
+        Return `expr` as a cast operand: unchanged if it is one token or a call, else parenthesised.
+        """
+        tokens = ctokenize(expr)
+        if len(tokens) == 1:
+            return expr
+        if (
+            len(tokens) >= 3
+            and _IDENT_RX.match(tokens[0].text)
+            and tokens[1].text == "("
+            and match_delimiter(tokens, 1) == len(tokens) - 1
+        ):
+            return expr
+        return f"({expr})"
 
 
-# --- ternary-fold helpers (token-level, string-safe) ---------------------------
-def _parse_assign(toks, lo: int, hi: int):
-    """If ``toks[lo:hi]`` is a single ``LV = RHS`` (optional trailing ``;``),
-    return ``(lv_lo, lv_hi, rhs_lo, rhs_hi)`` token-index spans; else None."""
-    if hi > lo and toks[hi - 1][0] == ";":
-        hi -= 1
-    depth, eq = 0, None
-    for j in range(lo, hi):
-        t = toks[j][0]
-        if t in "([{":
-            depth += 1
-        elif t in ")]}":
-            depth -= 1
-        elif depth == 0 and t == ";":
-            return None  # more than one statement
-        elif depth == 0 and t == "=":
-            if eq is not None:
-                return None  # chained assignment
-            eq = j
-    if eq is None or eq == lo or eq + 1 >= hi:
-        return None
-    return lo, eq, eq + 1, hi
-
-
-def _branch(toks, start: int):
-    """Parse a then/else branch beginning at token ``start``.
-
-    Returns ``(assign_spans_or_None, after_index, end_char)`` where
-    ``assign_spans`` is the ``_parse_assign`` tuple for a single-assignment
-    branch (braced or bare), or None if the branch is not exactly one assignment.
+# Helpers for `TernaryFromIfElse`, on the tokens from `ctokenize`.
+def _parse_assign(tokens: List[CToken], start: int, end: int) -> Optional[Tuple[int, int, int, int]]:
     """
-    n = len(toks)
-    if start >= n:
+    If `tokens[start:end]` is one assignment `LV = RHS` (with an optional `;`), return the token spans
+    `(lv_start, lv_end, rhs_start, rhs_end)`, else None.
+    """
+    if end > start and tokens[end - 1].text == ";":
+        end -= 1
+    depth, assign_index = 0, None
+    for index in range(start, end):
+        text = tokens[index].text
+        if text in "([{":
+            depth += 1
+        elif text in ")]}":
+            depth -= 1
+        elif depth == 0 and text == ";":
+            return None  # more than one statement
+        elif depth == 0 and text == "=":
+            if assign_index is not None:
+                return None  # chained assignment
+            assign_index = index
+    if assign_index is None or assign_index == start or assign_index + 1 >= end:
         return None
-    if toks[start][0] == "{":
-        close = _match_delim(toks, start)
+    return start, assign_index, assign_index + 1, end
+
+
+def _branch(tokens: List[CToken], start: int) -> Optional[Tuple[Optional[Tuple[int, int, int, int]], int, int]]:
+    """
+    Parse the then or else branch, braced or not, that starts at token `start`.
+
+    Return `(spans, after, end)`: `spans` from `_parse_assign`, or None if the branch is not exactly one assignment;
+    `after` is the index of the token after the branch and `end` the offset where it ends. Return None if there is no
+    complete branch.
+    """
+    token_count = len(tokens)
+    if start >= token_count:
+        return None
+    if tokens[start].text == "{":
+        close = match_delimiter(tokens, start)
         if close is None:
             return None
-        return _parse_assign(toks, start + 1, close), close + 1, toks[close][2]
-    depth, j = 0, start
-    while j < n:
-        t = toks[j][0]
-        if t in "([{":
+        return _parse_assign(tokens, start + 1, close), close + 1, tokens[close].end
+    depth, index = 0, start
+    while index < token_count:
+        text = tokens[index].text
+        if text in "([{":
             depth += 1
-        elif t in ")]}":
+        elif text in ")]}":
             depth -= 1
-        elif depth == 0 and t == ";":
-            return _parse_assign(toks, start, j), j + 1, toks[j][2]
-        j += 1
+        elif depth == 0 and text == ";":
+            return _parse_assign(tokens, start, index), index + 1, tokens[index].end
+        index += 1
     return None
 
 
-# Top-level tokens that make a ternary fold unsafe in the condition or a branch:
-# ``?``/``,`` would change precedence once inlined, and a bare ``=`` in the
-# condition (``if (x = y) ...``) is a side-effecting assignment that must run
-# unconditionally -- folding it into ``LV = (x = y) ? a : b`` makes it conditional.
-# (``==``/``+=``/... are distinct single tokens and remain foldable.)
+# Top-level tokens that block the fold in the condition or a branch: `?` and `,` would regroup once inlined, and so
+# would a bare `=` in the condition (`if (a = b) ...`), which binds looser than `?:`. `==` is its own token and folds.
 _TERNARY_UNSAFE = frozenset({"?", ",", "="})
 _ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
+# The condition may not hold a top-level compound assignment either, for the same reason.
 _COND_UNSAFE = _TERNARY_UNSAFE | _ASSIGN_OPS
+# Tokens through which a condition may read memory that an update in the lvalue changes.
+_INDIRECT = frozenset({"*", "->", "["})
+
+
+def _has_update(tokens: List[CToken], start: int, end: int) -> bool:
+    """
+    True if `tokens[start:end]` holds `++`, `--` or an assignment, at any depth.
+    """
+    return any(token.text in ("++", "--") or token.text in _ASSIGN_OPS for token in tokens[start:end])
+
+
+def _has_call(tokens: List[CToken], start: int, end: int) -> bool:
+    """
+    True if `tokens[start:end]` holds a call, at any depth: `name(`, `tab[0](` or `(*fp)(`.
+
+    `sizeof(` and casts are not calls; a `(...)` group before `(` is a callee only if it starts with `*`, which a type
+    never does. `(fp)(x)` cannot be told from a cast and is not counted.
+    """
+    for index in range(start + 1, end):
+        if tokens[index].text != "(":
+            continue
+        before = tokens[index - 1].text
+        if before == "]" or (_IDENT_RX.match(before) and before not in _NONVALUE_KW):
+            return True
+        if before == ")":
+            opener = _open_paren(tokens, start, index - 1)
+            if opener is not None and tokens[opener + 1].text == "*":
+                return True
+    return False
+
+
+def _open_paren(tokens: List[CToken], start: int, close: int) -> Optional[int]:
+    """
+    Return the index of the `(` that matches the `)` at `close`, searching back to `start`, or None.
+    """
+    depth = 0
+    for index in range(close, start - 1, -1):
+        if tokens[index].text == ")":
+            depth += 1
+        elif tokens[index].text == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _has_side_effect(tokens: List[CToken], start: int, end: int) -> bool:
+    """
+    True if `tokens[start:end]` holds `++`, `--`, an assignment or a call, at any depth.
+    """
+    return _has_update(tokens, start, end) or _has_call(tokens, start, end)
+
+
+def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
+    """
+    The identifiers in `tokens[start:end]`, keywords excluded.
+    """
+    return {token.text for token in tokens[start:end] if _IDENT_RX.match(token.text) and token.text not in _NONVALUE_KW}
 
 
 class TernaryFromIfElse(Transform):
-    """Collapse ``if (C) LV = A; else LV = B;`` into ``LV = C ? A : B;``.
+    """
+    Fold `if (C) LV = A; else LV = B;` into `LV = C ? A : B;`, with braced or bare branches.
 
-    Both branches must be a single plain assignment to the *same* left-hand
-    side (token-identical). This is safe for arbitrary side effects: exactly one
-    of ``A``/``B`` is evaluated in either form, ``C`` once, and ``LV`` once, so
-    the rewrite preserves evaluation. Branches may be braced or bare. As a
-    correctness guard we refuse to fold when ``C``, ``A``, or ``B`` contains a
-    top-level ``?`` or ``,`` (whose precedence would change once inlined), which
-    also prevents building ambiguous nested ternaries; the condition is
-    additionally rejected if it holds a top-level assignment, which binds looser
-    than ``?:`` (``if (a = b) ...`` must not become ``x = a = b ? 1 : 2``).
+    Both branches must be one plain assignment to the same (token-identical) `LV`. Both forms evaluate `C` and `LV`
+    once and one of `A` and `B`, but only the if runs `C` before `LV`. So the fold is refused when:
+
+    * `C` has a side effect (`++`, `--`, assignment, call), unless `LV` is a name that `C` does not use;
+    * `LV` has a call;
+    * `LV` has `++`, `--` or an assignment, and `C` shares a name with it or reads memory through `*`, `->` or `[`;
+    * `C`, `A` or `B` has a top-level `?` or `,`, or `C` a top-level assignment, which would regroup once inlined
+      (`if (a = b) ...` must not become `x = a = b ? 1 : 2`).
+
+    Known gap (CODE_REVIEW 1.5): `?:` converts `A` and `B` to a common type before the store, so branches of different
+    types (`-1` and `1u`) can change the stored value. Without type information this is not detected.
     """
 
     id = "ternary"
@@ -701,84 +799,91 @@ class TernaryFromIfElse(Transform):
     description = "Fold a same-target if/else assignment into a ternary."
 
     def apply(self, code: str) -> str:
-        # Collect every disjoint fold in a single tokenization, then apply them
-        # right-to-left so earlier offsets stay valid. Folded branches contain a
-        # top-level ``?`` (rejected by ``_TERNARY_UNSAFE``), so a fold never
-        # enables an enclosing one; the bounded outer loop is just a safety net
-        # and normally converges in one pass. (Collecting the folds in one
-        # tokenization keeps this O(n) per pass; re-tokenizing per fold would be
-        # O(folds*n), pathological on large decompiled files.)
-        for _ in range(64):
-            folds = self._folds(code)
-            if not folds:
-                break
-            for lo, hi, new in reversed(folds):
-                code = code[:lo] + new + code[hi:]
+        """
+        Return `code` with every foldable if/else written as a ternary.
+        """
+        # Collect every disjoint fold in one tokenization and apply them right to left, so earlier offsets stay valid.
+        # A folded branch holds a top-level `?`, which `_TERNARY_UNSAFE` rejects, so a fold never enables an enclosing
+        # one and one pass is enough.
+        for start, end, replacement in reversed(self._folds(code)):
+            code = code[:start] + replacement + code[end:]
         return code
 
-    def _folds(self, code: str):
-        """All non-overlapping ``if/else`` -> ternary rewrites, left to right."""
-        toks = _tok_offsets(code)
-        n = len(toks)
-        out: list[tuple[int, int, str]] = []
-        i = 0
-        while i < n:
-            if toks[i][0] != "if" or i + 1 >= n or toks[i + 1][0] != "(":
-                i += 1
+    def _folds(self, code: str) -> List[Tuple[int, int, str]]:
+        """
+        Return all non-overlapping if/else -> ternary rewrites, left to right.
+        """
+        tokens = ctokenize(code)
+        token_count = len(tokens)
+        folds: List[Tuple[int, int, str]] = []
+        index = 0
+        while index < token_count:
+            if tokens[index].text != "if" or index + 1 >= token_count or tokens[index + 1].text != "(":
+                index += 1
                 continue
-            cp = _match_delim(toks, i + 1)
-            if cp is None or cp <= i + 2:  # need a non-empty condition
-                i += 1
+            cond_start = index + 2
+            cond_end = match_delimiter(tokens, index + 1)  # the `)` after the condition
+            if cond_end is None or cond_end <= cond_start:  # need a non-empty condition
+                index += 1
                 continue
-            th = _branch(toks, cp + 1)
-            if not th or th[0] is None:
-                i += 1
+            then_branch = _branch(tokens, cond_end + 1)
+            if not then_branch or then_branch[0] is None:
+                index += 1
                 continue
-            then_a, after_then, _ = th
-            if after_then >= n or toks[after_then][0] != "else":
-                i += 1
+            then_spans, after_then, _ = then_branch
+            if after_then >= token_count or tokens[after_then].text != "else":
+                index += 1
                 continue
-            eb = _branch(toks, after_then + 1)
-            if not eb or eb[0] is None:
-                i += 1
+            else_branch = _branch(tokens, after_then + 1)
+            if not else_branch or else_branch[0] is None:
+                index += 1
                 continue
-            else_a, after_else, end_char = eb
+            else_spans, after_else, fold_end = else_branch
 
-            lv1_lo, lv1_hi, r1_lo, r1_hi = then_a
-            lv2_lo, lv2_hi, r2_lo, r2_hi = else_a
-            if [t[0] for t in toks[lv1_lo:lv1_hi]] != [t[0] for t in toks[lv2_lo:lv2_hi]]:
-                i += 1
+            lv_start, lv_end, then_start, then_end = then_spans
+            else_lv_start, else_lv_end, else_start, else_end = else_spans
+            if [token.text for token in tokens[lv_start:lv_end]] != [
+                token.text for token in tokens[else_lv_start:else_lv_end]
+            ]:
+                index += 1
                 continue
             if (
-                _has_top_level_token(toks, i + 2, cp, _COND_UNSAFE)
-                or _has_top_level_token(toks, r1_lo, r1_hi, _TERNARY_UNSAFE)
-                or _has_top_level_token(toks, r2_lo, r2_hi, _TERNARY_UNSAFE)
+                has_top_level_token(tokens, cond_start, cond_end, _COND_UNSAFE)
+                or has_top_level_token(tokens, then_start, then_end, _TERNARY_UNSAFE)
+                or has_top_level_token(tokens, else_start, else_end, _TERNARY_UNSAFE)
             ):
-                i += 1
+                index += 1
+                continue
+            # The if runs the condition before the lvalue; `LV = C ? A : B` does not fix their order. An update in
+            # the lvalue can only reach the condition through a shared name or memory read via `*`, `->`, `[`.
+            shared = _identifiers(tokens, cond_start, cond_end) & _identifiers(tokens, lv_start, lv_end)
+            lv_is_name = lv_end - lv_start == 1 and _IDENT_RX.match(tokens[lv_start].text)
+            cond_reads_memory = any(token.text in _INDIRECT for token in tokens[cond_start:cond_end])
+            if (
+                (_has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
+                or _has_call(tokens, lv_start, lv_end)
+                or (_has_update(tokens, lv_start, lv_end) and (shared or cond_reads_memory))
+            ):
+                index += 1
                 continue
 
-            cond = code[toks[i + 2][1] : toks[cp - 1][2]].strip()
-            lv = code[toks[lv1_lo][1] : toks[lv1_hi - 1][2]].strip()
-            a = code[toks[r1_lo][1] : toks[r1_hi - 1][2]].strip()
-            b = code[toks[r2_lo][1] : toks[r2_hi - 1][2]].strip()
-            out.append((toks[i][1], end_char, f"{lv} = {cond} ? {a} : {b};"))
-            i = after_else  # skip the consumed region: keeps folds disjoint
-        return out
+            condition = code[tokens[cond_start].start : tokens[cond_end - 1].end].strip()
+            lvalue = code[tokens[lv_start].start : tokens[lv_end - 1].end].strip()
+            then_value = code[tokens[then_start].start : tokens[then_end - 1].end].strip()
+            else_value = code[tokens[else_start].start : tokens[else_end - 1].end].strip()
+            folds.append((tokens[index].start, fold_end, f"{lvalue} = {condition} ? {then_value} : {else_value};"))
+            index = after_else  # skip the folded region, so folds stay disjoint
+        return folds
 
 
 class CanonicalizeControlFlow(Transform):
-    """Canonicalize control flow by cleaning up dead labels and jumps.
+    """
+    Remove gotos and labels that do nothing.
 
-    Two safe, CFG-free simplifications that decompiler output invites:
+    * A `goto X;` directly followed by the label `X:` is removed: control falls through to `X` anyway.
+    * A label `X:` that no `goto X` refers to is removed, but the statement it labels stays.
 
-    * **Dead forward jump.** ``goto X;`` immediately followed by the label
-      ``X:`` is removed --- control already falls through to ``X``.
-    * **Unreferenced label.** A label definition ``X:`` with no remaining
-      ``goto X`` anywhere is dropped (keeping the statement it tagged).
-
-    Both are lossless. Full goto-to-structured-control reconstruction needs a
-    control-flow graph and is out of scope; these passes only remove jumps and
-    labels that provably do nothing.
+    Turning gotos into structured control flow would need a control-flow graph and is out of scope.
     """
 
     id = "cfg-canon"
@@ -786,97 +891,80 @@ class CanonicalizeControlFlow(Transform):
     description = "Remove no-op gotos and unreferenced labels."
 
     _GOTO = re.compile(r"^\s*goto\s+([A-Za-z_]\w*)\s*;\s*$")
-    _LABEL = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*:(?!:)")
-    _NON_LABEL = frozenset({"default", "case"})
+    # One label in a prefix from `_split_leading_labels`, with the whitespace after it.
+    _LABEL_NAME = re.compile(r"([A-Za-z_]\w*)\s*:\s*")
 
     def apply(self, code: str) -> str:
+        """
+        Return `code` without dead gotos and unused labels.
+        """
         code = self._drop_dead_jumps(code)
         code = self._drop_unreferenced_labels(code)
         return code
 
     def _drop_dead_jumps(self, code: str) -> str:
-        pieces = _split_statements(code)
-        out: list[str] = []
-        i, n = 0, len(pieces)
-        while i < n:
-            mg = self._GOTO.match(pieces[i])
-            nxt = pieces[i + 1] if i + 1 < n else ""
-            ml = self._LABEL.match(nxt.lstrip()) if nxt else None
-            if mg and ml and ml.group(2) == mg.group(1):
-                i += 1  # skip the redundant goto; keep the labelled statement
-                continue
-            out.append(pieces[i])
-            i += 1
-        return "".join(out)
+        """
+        Return `code` without the `goto X;` statements whose next kept statement is labeled `X:`.
+        """
+        # Right to left, so a goto is compared with the next statement that is kept: in `goto A; goto B; B: A: x;` both
+        # gotos go in one pass.
+        kept_pieces: List[str] = []
+        next_labels: Set[str] = set()  # labels directly in front of the next kept statement
+        for piece in reversed(split_statements(code)):
+            labels, statement = _split_leading_labels(piece)
+            names = set(self._LABEL_NAME.findall(labels))
+            goto_match = self._GOTO.match(statement)
+            if goto_match and goto_match.group(1) in next_labels:
+                # Drop the goto. Its own labels now stand in front of the next statement.
+                kept_pieces.append(labels)
+                next_labels |= names
+            else:
+                kept_pieces.append(piece)
+                next_labels = names
+        return "".join(reversed(kept_pieces))
 
-    # A label is referenced by a plain ``goto X`` or by GCC's label-address
-    # operator ``&&X`` (computed goto). ``&&`` also spells logical-AND, but
-    # over-counting an ``&&`` operand as a label reference is the safe direction:
-    # it keeps a label rather than dropping a live one, so a computed goto's target
-    # is never orphaned. (Decompilers rarely emit computed gotos, so the only cost
-    # is occasionally not dropping a genuinely dead label.)
+    # A label is referenced by `goto X` or by GCC's label address `&&X` (computed goto). `&&` is also logical AND, but
+    # counting such an operand as a reference only keeps a dead label, never drops a live one.
     _LABEL_REF = re.compile(r"\bgoto\s+([A-Za-z_]\w*)|&&\s*([A-Za-z_]\w*)")
 
     def _drop_unreferenced_labels(self, code: str) -> str:
+        """
+        Return `code` without the labels that no `goto` or `&&` refers to.
+        """
         referenced = {
-            g
+            name
             for seg_type, text in scan(code)
             if seg_type == SegmentType.CODE
-            for m in self._LABEL_REF.finditer(text)
-            for g in m.groups()
-            if g
+            for ref_match in self._LABEL_REF.finditer(text)
+            for name in ref_match.groups()
+            if name
         }
-        out: list[str] = []
-        for piece in _split_statements(code):
-            ml = self._LABEL.match(piece)
-            if ml and ml.group(2) not in self._NON_LABEL and ml.group(2) not in referenced:
-                # Drop the "name:" prefix, keep its leading whitespace + the rest.
-                out.append(ml.group(1) + piece[ml.end() :].lstrip())
-            else:
-                out.append(piece)
-        return "".join(out)
+        transformed_pieces: List[str] = []
+        for piece in split_statements(code):
+            # Check every leading label, not only the first: in `B: A: x;` both may be unused.
+            labels, statement = _split_leading_labels(piece)
+            kept_labels = self._LABEL_NAME.sub(
+                lambda label_match: label_match.group(0) if label_match.group(1) in referenced else "", labels
+            )
+            transformed_pieces.append(kept_labels + statement)
+        return "".join(transformed_pieces)
 
 
-# An identifier, and the statement keywords that can legitimately sit just
-# before a unary ``*`` deref or that must never be read as an operand value.
-# (Numeric operands are matched with ``CINT``.)
+# An identifier, and the keywords that may stand before a unary `*` and are never an operand value. (Numbers are
+# matched with `CINT`.)
 _IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
 _NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
 class MinimizeIntegerLiterals(Transform):
-    """Re-spell hexadecimal integer literals in the shorter decimal form.
+    """
+    Write a hex integer literal in decimal when that is shorter: `0x10` -> `16`, `0xff` -> `255`.
 
-    Decompilers print *every* integer constant in hexadecimal --- loop bounds,
-    struct offsets, small counts, ``0`` --- whereas authored C already writes the
-    small ones in decimal and reserves hex for masks and addresses. Because the
-    hex spelling is the decompiler's habit rather than analyst signal, rewriting
-    ``0x10`` to ``16`` is a pure radix change: the numeric value, and therefore the
-    meaning, is identical, so this is a lossless (T2) rewrite that a source-code
-    reformatter would never have occasion to make.
-
-    The rewrite is self-selecting and fires only where it *shrinks* the text: it
-    converts a hex literal to decimal exactly when the decimal spelling has fewer
-    characters (``0x10`` -> ``16``, ``0xff`` -> ``255``, ``0xffff`` -> ``65535``),
-    and leaves it as hex otherwise (``0xffffff`` -> ``16777215`` is no shorter;
-    ``0xffffffff`` -> ``4294967295`` is no shorter), so the wider bitmasks --- where
-    the hex grouping carries a visual cue --- keep their hex form. (The 8- and
-    16-bit round masks ``0xff``/``0xffff`` are short enough in decimal to convert;
-    the lost hex grouping is a minor readability trade for a strictly lossless
-    radix change.) The character count is the tokenizer-independent surrogate the
-    tool optimizes (the design is model-agnostic); fewer characters do not
-    *guarantee* fewer tokens under an arbitrary vocabulary, but for typical LLM
-    tokenizers this is the single largest lossless lever in decompiler output.
-
-    Only values that fit in a signed ``int`` (``<= 0x7fffffff``) are converted, so
-    the literal's *type* is unchanged: for such values the decimal and hexadecimal
-    spellings (with any shared ``u``/``l`` suffix) denote the same ``int``/
-    ``unsigned`` type, whereas a value in ``(INT_MAX, UINT_MAX]`` would be
-    ``unsigned int`` in hex but ``long`` in decimal. Larger values are also where
-    hex is already the shorter spelling, so the type guard costs no savings. Any
-    integer-suffix token (``0x10u`` -> ``16u``) is left attached untouched.
-    Operates on CODE segments only, so hex inside strings/comments is never
-    rewritten.
+    Decompilers print every integer in hex, so the hex form is their habit, not analyst signal, and the value does not
+    change. A literal stays hex when decimal is no shorter (`0xffffff`, `0xffffffff`), so wide masks keep their hex
+    form. Only values up to `0x7fffffff` are converted, so the type stays the same: above that, hex would be
+    `unsigned int` but decimal `long`. A suffix stays attached (`0x10u` -> `16u`). Fewer characters do not guarantee
+    fewer tokens for every tokenizer, but for typical LLM tokenizers they do.
     """
 
     id = "int-minform"
@@ -887,122 +975,106 @@ class MinimizeIntegerLiterals(Transform):
     _INT_MAX = 0x7FFFFFFF
 
     def apply(self, code: str) -> str:
-        edits: list[tuple[int, int, str]] = []
-        for text, start, end in _tok_offsets(code):
+        """
+        Return `code` with every hex literal written in decimal where that is shorter and keeps the type.
+        """
+        edits: List[Tuple[int, int, str]] = []
+        for token in ctokenize(code):
             # A hex-float literal (`0x1f.0p3`) is one token and never matches.
-            m = self._HEX.fullmatch(text)
-            if m is None:
+            hex_match = self._HEX.fullmatch(token.text)
+            if hex_match is None:
                 continue
-            hex_digits, suffix = m.groups()
+            hex_digits, suffix = hex_match.groups()
             value = int(hex_digits, 16)
             if value > self._INT_MAX:
                 continue  # wider than int: decimal would change the literal's type
-            dec = str(value)
-            if len(dec) < len(hex_digits):
-                edits.append((start, end, dec + suffix))
+            decimal = str(value)
+            if len(decimal) < len(hex_digits):
+                edits.append((token.start, token.end, decimal + suffix))
         if not edits:
             return code
-        # Single forward pass: a hex-heavy file yields thousands of edits, so the
-        # naive slice-per-edit rebuild would be quadratic.
-        out: list[str] = []
-        last = 0
-        for lo, hi, rep in edits:
-            out.append(code[last:lo])
-            out.append(rep)
-            last = hi
-        out.append(code[last:])
-        return "".join(out)
+        # Build the result in one forward pass: a hex-heavy file has thousands of edits, and slicing per edit is
+        # quadratic.
+        transformed_parts: List[str] = []
+        copied_up_to = 0
+        for start, end, replacement in edits:
+            transformed_parts.append(code[copied_up_to:start])
+            transformed_parts.append(replacement)
+            copied_up_to = end
+        transformed_parts.append(code[copied_up_to:])
+        return "".join(transformed_parts)
 
 
 class DerefOffsetToIndex(Transform):
-    """Rewrite a dereferenced pointer-add ``*(p + N)`` to the index form ``p[N]``.
+    """
+    Rewrite `*(p + N)` as `p[N]`, which means the same in C for any pointer `p` and integer `N`.
 
-    ``*(p + n)`` and ``p[n]`` are identical in C for any pointer ``p`` and integer
-    ``n``, so a decompiler's explicit-add spelling of an array/field read
-    (``*(ji + 8)``, ``*(&mw + 0xc)``) is rewritten to the shorter, equivalent
-    subscript form. Authored C writes ``p[n]`` directly; the explicit-add spelling
-    is a decompiler lowering, so this is a lossless (T2) rewrite.
+    The `*` must be a dereference, not a multiply, so the token before it must not be a value: `a * (b + c)` stays,
+    `= *(p + 4)` is rewritten. The token after `)` must not be a postfix operator (`.`, `->`, `(`, `[`, `++`, `--`),
+    which binds tighter than prefix `*`. The base must be a name or `&name` (written `(&x)[N]`), and `N` an integer
+    literal.
 
-    Two guards keep it sound. The ``*`` must be a *unary* dereference, never the
-    binary multiply: we rewrite only when the token before ``*`` is not a value
-    (so ``a * (b + c)`` is left alone but ``= *(p + 4)`` is rewritten), the same
-    unary-position test the address-of and null-cast passes use. And the token
-    *after* the closing ``)`` must not be a postfix operator (``.``/``->``/``(``/
-    ``[``/``++``/``--``), since those bind tighter than the prefix ``*`` and would
-    re-associate against the new subscript. The base must be a single identifier
-    (optionally address-of ``&x``, which is parenthesised as ``(&x)[N]`` to keep
-    its precedence) and the offset a single integer literal.
-
-    What the offset *means*, though, is the decompiler's business and not C's, and
-    the three back ends disagree. Ghidra always casts the sum
-    (``*(uint *)(param_1 + 0x18)``), an inner shape this pass declines, so it never
-    fires on Ghidra output at all. Hex-Rays types the base, so ``*(this + 6)`` on a
-    ``_DWORD *this`` is genuine typed pointer arithmetic and ``this[6]`` says
-    exactly the same thing. Binary Ninja is the awkward one: it reserves the
-    subscript form for a scaled element index and falls back to the explicit add
-    precisely when the displacement is a raw *byte* offset the subscript could not
-    express. The bundled examples catch one function both ways --- the
-    ``std::string`` capacity probe at ``0x402FA0`` is ``*(this + 6)`` to Hex-Rays
-    and ``*(arg1 + 0x18)`` on a ``void* arg1`` to Binary Ninja: the same field at
-    byte 0x18, counted in elements by one tool and in bytes by the other.
-
-    The rewrite stays lossless either way --- ``*(p + n)`` and ``p[n]`` are the
-    same expression in C for every ``p``, including the ``void*`` case --- but on
-    Binary Ninja input it re-spells a byte displacement in the very notation Binary
-    Ninja reserves for element counts. ``arg1[0x18]`` therefore invites a reader
-    (or a model) reconstructing a struct layout to scale the offset a second time.
-    Nothing about the program changes; only the connotation does, and only for the
-    byte-offset dialect.
+    What `N` counts depends on the decompiler. Ghidra always casts the sum (`*(uint *)(param_1 + 0x18)`), which this
+    pass skips. Hex-Rays types the base, so `*(this + 6)` on a `_DWORD *this` becomes `this[6]` with the same meaning.
+    Binary Ninja writes a subscript for an element index and the add for a byte offset, so on its output `arg1[0x18]`
+    looks like an element index although it is a byte offset. The `std::string` capacity check at `0x402FA0` in the
+    examples is `*(this + 6)` in Hex-Rays and `*(arg1 + 0x18)` in Binary Ninja. The program stays the same; only that
+    hint is lost.
     """
 
     id = "deref-offset"
     tier = Tier.T2_STRUCTURAL
     description = "Rewrite a dereferenced pointer-add as a subscript."
 
-    # Tokens after which a ``*`` is the binary multiply, not a unary dereference.
-    # A postfix ``++``/``--`` ends an operand (``x++ * (p + 4)`` is a multiply of
-    # ``x++`` by ``(p + 4)``), so it counts as a value here. This also declines the
-    # mirror prefix case ``++*(p + 4)`` --- which a unary deref *could* rewrite ---
-    # because the two are textually indistinguishable; declining is the lossless
-    # direction (a missed rewrite, never a wrong one).
+    # Tokens after which `*` is a multiply. A postfix `++`/`--` ends an operand (`x++ * (p + 4)`). This also skips the
+    # prefix case `++*(p + 4)`, which looks the same; skipping only misses a rewrite.
     _VALUE_BEFORE = frozenset({")", "]", "++", "--"})
-    # Postfix operators bind tighter than prefix ``*``; if one follows the ``)``
-    # the rewrite would change associativity, so we decline.
+    # Postfix operators bind tighter than prefix `*`, so a rewrite before one would regroup the expression.
     _BLOCK_AFTER = frozenset({".", "->", "(", "[", "++", "--"})
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
-        n = len(toks)
-        edits: list[tuple[int, int, str]] = []
-        i = 0
-        while i < n:
-            if toks[i][0] == "*" and i + 1 < n and toks[i + 1][0] == "(":
-                prev = toks[i - 1][0] if i > 0 else None
-                # ``CNUMBER``, not ``CINT``: a match here only *declines* the
-                # rewrite, so the wider form is the lossless direction. A float
-                # left operand (``1.5 * (a + 4)``) is still a value, and reading
-                # its ``*`` as a deref would corrupt the multiply.
-                is_value = prev is not None and (
-                    prev in self._VALUE_BEFORE or CNUMBER.fullmatch(prev) or (_IDENT_RX.match(prev) and prev not in _NONVALUE_KW)
+        """
+        Return `code` with every safe `*(p + N)` rewritten as `p[N]`.
+        """
+        tokens = ctokenize(code)
+        token_count = len(tokens)
+        edits: List[Tuple[int, int, str]] = []
+        index = 0
+        while index < token_count:
+            if tokens[index].text == "*" and index + 1 < token_count and tokens[index + 1].text == "(":
+                previous = tokens[index - 1].text if index > 0 else None
+                # `CNUMBER`, not `CINT`: a float (`1.5 * (a + 4)`) is a value too, and a match only skips the rewrite.
+                is_value = previous is not None and (
+                    previous in self._VALUE_BEFORE
+                    or CNUMBER.fullmatch(previous)
+                    or (_IDENT_RX.match(previous) and previous not in _NONVALUE_KW)
                 )
                 if not is_value:
-                    close = _match_delim(toks, i + 1)
+                    close = match_delimiter(tokens, index + 1)
                     if close is not None:
-                        rep = self._index_form([t[0] for t in toks[i + 2 : close]])
-                        after = toks[close + 1][0] if close + 1 < n else None
-                        if rep is not None and after not in self._BLOCK_AFTER:
-                            edits.append((toks[i][1], toks[close][2], rep))
-                            i = close + 1
+                        replacement = self._index_form([token.text for token in tokens[index + 2 : close]])
+                        after = tokens[close + 1].text if close + 1 < token_count else None
+                        if replacement is not None and after not in self._BLOCK_AFTER:
+                            edits.append((tokens[index].start, tokens[close].end, replacement))
+                            index = close + 1
                             continue
-            i += 1
-        for lo, hi, rep in reversed(edits):
-            code = code[:lo] + rep + code[hi:]
+            index += 1
+        for start, end, replacement in reversed(edits):
+            code = code[:start] + replacement + code[end:]
         return code
 
     @staticmethod
-    def _index_form(inner: list[str]) -> str | None:
-        """Return ``base[off]`` for an inner ``IDENT + NUM`` / ``& IDENT + NUM``."""
-        if len(inner) == 3 and _IDENT_RX.match(inner[0]) and inner[0] not in _NONVALUE_KW and inner[1] == "+" and CINT.fullmatch(inner[2]):
+    def _index_form(inner: List[str]) -> Optional[str]:
+        """
+        Return `name[N]` for the inner tokens `name + N` or `& name + N`, else None.
+        """
+        if (
+            len(inner) == 3
+            and _IDENT_RX.match(inner[0])
+            and inner[0] not in _NONVALUE_KW
+            and inner[1] == "+"
+            and CINT.fullmatch(inner[2])
+        ):
             return f"{inner[0]}[{inner[2]}]"
         if (
             len(inner) == 4
@@ -1017,15 +1089,12 @@ class DerefOffsetToIndex(Transform):
 
 
 class DropTrailingReturn(Transform):
-    """Drop a redundant ``return;`` at the very end of a function body.
+    """
+    Remove a `return;` that is the last statement of a function body, since control falls off the end anyway.
 
-    A bare ``return;`` as the last statement before a function's closing brace is
-    a no-op: control falls off the end either way. Ghidra emits one at the end of
-    every ``void`` function. We delete the ``return;`` only when its ``;`` is
-    immediately followed by the ``}`` that closes a *function body* (the brace that
-    returns the brace depth to zero), never a nested block --- a ``return;`` ending
-    a loop or ``if`` body exits the whole function early and is not redundant.
-    Lossless (T2): the statement does nothing the implicit fall-through does not.
+    Ghidra ends every `void` function with one. The `return;` must be followed directly by the `}` that closes the
+    function; one at the end of a loop or `if` body leaves the function early and stays. It must also be a statement
+    of its own, not the unbraced body of `if`, `else` or a loop, or the statement of a label.
     """
 
     id = "drop-trailing-return"
@@ -1033,28 +1102,29 @@ class DropTrailingReturn(Transform):
     description = "Drop a redundant trailing return at the end of a function body."
 
     def apply(self, code: str) -> str:
-        toks = _tok_offsets(code)
+        """
+        Return `code` without the redundant `return;` at the end of each function body.
+        """
+        tokens = ctokenize(code)
         depth = 0
-        edits: list[tuple[int, int]] = []
-        for j, (t, _s, _e) in enumerate(toks):
-            if t == "{":
+        edits: List[Tuple[int, int]] = []
+        for index, token in enumerate(tokens):
+            if token.text == "{":
                 depth += 1
-            elif t == "}":
+            elif token.text == "}":
                 depth -= 1
-                # A function body closes when the depth returns to 0. If the two
-                # tokens it closes over are exactly `return ;`, that return is the
-                # redundant fall-off-the-end statement.
-                # ... unless the `return` is the sole statement of a label
-                # (`done: return; }`): dropping it would leave `done: }`, a label
-                # with no statement (invalid C before C23), so keep it.
+                # A function body closes when the depth is back to 0. If it ends in `return ;`, that return is
+                # redundant, unless it is the unbraced body of `if (c)`, `else`, `for (...)` or `while (...)`, or of a
+                # label (`done: return; }`). Dropping it would leave `if (c) }` or `done: }`, so it must follow `;`, `{`
+                # or `}`.
                 if (
                     depth == 0
-                    and j >= 2
-                    and toks[j - 1][0] == ";"
-                    and toks[j - 2][0] == "return"
-                    and not (j >= 3 and toks[j - 3][0] == ":")
+                    and index >= 3
+                    and tokens[index - 1].text == ";"
+                    and tokens[index - 2].text == "return"
+                    and tokens[index - 3].text in (";", "{", "}")
                 ):
-                    edits.append((toks[j - 2][1], toks[j - 1][2]))
-        for lo, hi in reversed(edits):
-            code = code[:lo] + code[hi:]
+                    edits.append((tokens[index - 2].start, tokens[index - 1].end))
+        for start, end in reversed(edits):
+            code = code[:start] + code[end:]
         return code

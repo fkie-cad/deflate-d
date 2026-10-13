@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-
 from typing import List
 
 from .transforms import build_pipeline, parse_tier
@@ -81,7 +80,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--exclude", default="", metavar="ID[,ID...]", help="comma-separated transform ids to skip")
     parser.add_argument("--list", action="store_true", help="list transform ids per tier and exit")
-    parser.add_argument("--list-verbose", action="store_true", help="like --list, but also show each transform's description")
+    parser.add_argument(
+        "--list-verbose", action="store_true", help="like --list, but also show each transform's description"
+    )
     return parser
 
 

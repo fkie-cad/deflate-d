@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated.transforms import DropSingleStatementBraces
 
 
@@ -39,7 +41,11 @@ class TestDropSingleStatementBraces:
         # `switch(x)case 1:break;` is invalid C. Even a single-statement switch
         # body must keep them (regression for switch being wrongly elidable).
         b = DropSingleStatementBraces()
-        for src in ("switch (x) {\n  case 1: break;\n}\n", "switch (x) {\n  case 1: g();\n}\n", "switch (x) {\n  default: h();\n}\n"):
+        for src in (
+            "switch (x) {\n  case 1: break;\n}\n",
+            "switch (x) {\n  case 1: g();\n}\n",
+            "switch (x) {\n  default: h();\n}\n",
+        ):
             assert "{" in b.apply(src) and "}" in b.apply(src), src
 
     def test_sole_declaration_kept(self) -> None:
@@ -77,6 +83,11 @@ class TestDropSingleStatementBraces:
         b = DropSingleStatementBraces()
         out = b.apply("if (c) {\n  goto LAB_1;\n}\n")
         assert "{" not in out and "goto LAB_1;" in out
+
+    def test_delete_body_unwrapped(self) -> None:
+        # `delete p;` is a statement, not a declaration, so the braces can go.
+        out = DropSingleStatementBraces().apply("if (c) {\n  delete p;\n}\n")
+        assert "{" not in out and "delete p;" in out
 
     def test_braces_inside_string_preserved(self) -> None:
         b = DropSingleStatementBraces()
@@ -130,3 +141,18 @@ class TestDropSingleStatementBraces:
         out = b.apply("if (a) {\n  if (b) {\n    f();\n  }\n}\n")
         assert out.count("{") == 1 and out.count("}") == 1  # only the outer pair remains
         assert "f();" in out
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "if (a) {\n  if (b) {\n    x = 1;\n  }\n}\n",
+            "for (;;) {\n  while (c) {\n    if (b) {\n      x = 1;\n    }\n  }\n}\n",
+            "if (a) {\n  x = 1;\n}\nelse {\n  if (b) {\n    x = 2;\n  }\n}\n",
+            "do {\n  if (b) {\n    x = 1;\n  }\n} while (c);\n",
+        ],
+    )
+    def test_one_pass_reaches_fixed_point(self, src) -> None:
+        # Unwrapping an inner block never makes the outer one strippable (its body starts with a control keyword), so
+        # a second run must find nothing.
+        once = DropSingleStatementBraces().apply(src)
+        assert DropSingleStatementBraces().apply(once) == once

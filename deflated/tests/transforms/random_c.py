@@ -1,4 +1,6 @@
-"""Random decompiler-like C and a lexer independent of `cosmetic.py`, for the `ws-newlines`/`ws-tighten` property tests."""
+"""
+Random decompiler-like C and a lexer independent of `cosmetic.py`, for the `ws-newlines`/`ws-tighten` property tests.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +11,9 @@ from typing import List, Pattern, Tuple
 from deflated.transforms.lexer import SegmentType, scan, split_directives
 
 # The punctuators longer than one character: C digraphs and the C++ `::`, `.*`, `->*` included.
-PUNCTUATORS = "%:%: ... <<= >>= ->* -> .* :: ## %: <: :> <% %> ++ -- << >> <= >= == != && || -= += *= /= %= &= |= ^=".split()
+PUNCTUATORS = (
+    "%:%: ... <<= >>= ->* -> .* :: ## %: <: :> <% %> ++ -- << >> <= >= == != && || -= += *= /= %= &= |= ^=".split()
+)
 
 
 def pp_token(punctuators: List[str]) -> Pattern[str]:
@@ -18,7 +22,9 @@ def pp_token(punctuators: List[str]) -> Pattern[str]:
     exponent signs), identifier, one of `punctuators` (longest match first), or any other single character.
     """
     longest_first = sorted(punctuators, key=len, reverse=True)
-    return re.compile(r"\.?\d(?:[eEpP][+-]|[\w.])*|[A-Za-z_]\w*|" + "".join(re.escape(p) + "|" for p in longest_first) + r"\S")
+    return re.compile(
+        r"\.?\d(?:[eEpP][+-]|[\w.])*|[A-Za-z_]\w*|" + "".join(re.escape(p) + "|" for p in longest_first) + r"\S"
+    )
 
 
 PP_TOKEN = pp_token(PUNCTUATORS)

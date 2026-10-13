@@ -64,7 +64,11 @@ class TestElideThunkBodies:
         assert ElideThunkBodies().apply(src) == src
 
     def test_multiple_thunks_and_a_real_function(self) -> None:
-        src = "void free(void *p){(*PTR_free_1)();return;}" "int real(int x){int y;y=x*x;return y;}" "void abort(void){abort();}"
+        src = (
+            "void free(void *p){(*PTR_free_1)();return;}"
+            "int real(int x){int y;y=x*x;return y;}"
+            "void abort(void){abort();}"
+        )
         out = ElideThunkBodies().apply(src)
         assert "void free(void *p);" in out
         assert "void abort(void);" in out
@@ -97,7 +101,10 @@ class TestElideThunkBodies:
         # comparators forward the SAME worker but reorder/deref the parameters, so
         # the argument order is the semantics. They must not collapse to identical
         # prototypes (which would erase the sort direction).
-        src = "int fwd(char **a1, char **a2){return strcmp(*a1, *a2);}" "int rev(char **a1, char **a2){return strcmp(*a2, *a1);}"
+        src = (
+            "int fwd(char **a1, char **a2){return strcmp(*a1, *a2);}"
+            "int rev(char **a1, char **a2){return strcmp(*a2, *a1);}"
+        )
         assert ElideThunkBodies().apply(src) == src
 
     def test_lone_forwarder_kept(self) -> None:

@@ -22,13 +22,13 @@ dev = ["pytest", "black", "isort"]
 deflate-d = "deflated.reformat:main"
 
 [tool.black]
-line-length = 140
+line-length = 120
 target-version = ["py311"]
 
 [tool.isort]
 profile = "black"
 src_paths = ["deflated"]
-line_length = 140
+line_length = 120
 
 [tool.pytest.ini_options]
 testpaths = ["deflated/tests"]

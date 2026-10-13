@@ -6,7 +6,16 @@ from deflated import Tier, transform
 from deflated.transforms import build_pipeline
 
 T1_IDS = {"ws-collapse", "ws-indent", "ws-trailing", "ws-blanklines", "ws-newlines", "ws-tighten"}
-T2_IDS = {"comments", "ternary", "inline-temps", "decl-coalesce", "cast-elision", "brace-elision", "compound-assign", "cfg-canon"}
+T2_IDS = {
+    "comments",
+    "ternary",
+    "inline-temps",
+    "decl-coalesce",
+    "cast-elision",
+    "brace-elision",
+    "compound-assign",
+    "cfg-canon",
+}
 
 
 class TestTierT2:
@@ -31,6 +40,16 @@ class TestTierT2:
         out = transform(src, Tier.T2_STRUCTURAL)
         assert "iVar1" in out and "local_28" in out
         assert "__int64" in out  # simplify-types is T3
+
+    def test_keeps_return_inside_if(self) -> None:
+        # brace-elision turns the block into `if (c) return;`, which drop-trailing-return must keep.
+        src = "void f(int c) {\n  g();\n  if (c) {\n    return;\n  }\n}\n"
+        assert "return;" in build_pipeline("T2").apply(src)
+
+    def test_idempotent_with_many_double_casts(self) -> None:
+        src = "void f(void)\n{\n" + "".join(f"  a{i} = (int)(int)b;\n" for i in range(70)) + "}\n"
+        once = build_pipeline("T2").apply(src)
+        assert build_pipeline("T2").apply(once) == once
 
     def test_string_safety(self) -> None:
         assert '"a  //  b"' in transform('char *s = "a  //  b";\n', Tier.T2_STRUCTURAL)

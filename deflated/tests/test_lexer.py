@@ -10,8 +10,8 @@ from deflated import Tier, transform
 from deflated.transforms.lexer import (
     Segment,
     SegmentType,
-    map_code,
     lines_with_protection,
+    map_code,
     scan,
     split_directives,
     string_is_terminated,

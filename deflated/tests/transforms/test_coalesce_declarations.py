@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from deflated.transforms import CoalesceDeclarations
 
 
@@ -56,3 +58,19 @@ class TestCoalesceDeclarations:
         assert c.apply('s = "int a; int b;";') == 's = "int a; int b;";'
         # A comment between two declarations breaks the run; the literal is intact.
         assert c.apply("int a; /* int b; */ int c;") == "int a; /* int b; */ int c;"
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "delete p;\ndelete q;\n",
+            "throw p;\nthrow q;\n",
+            "new T;\nnew U;\n",
+            "co_return x;\nco_return y;\n",
+            "co_yield a;\nco_yield b;\n",
+            "co_await a;\nco_await b;\n",
+            "using namespace std;\nusing namespace boost;\n",
+        ],
+    )
+    def test_cpp_keyword_statements_not_coalesced(self, src) -> None:
+        # `delete p, q;` deletes only p: the comma operator evaluates q and discards it.
+        assert CoalesceDeclarations().apply(src) == src
