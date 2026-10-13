@@ -1,7 +1,8 @@
 """
 T1 cosmetic transforms: whitespace and layout changes only, so all of them are semantics-preserving.
 
-No pass changes the inside of a string, char literal or `__asm` block. `ws-collapse`, `ws-tighten`, `ws-comments` and
+No pass changes the inside of a string, char literal or `__asm { ... }` block. MSVC's brace-less `__asm` form is not
+supported: decompilers don't emit it, and the lexer reads it as plain code. `ws-collapse`, `ws-tighten`, `ws-comments` and
 `ws-newlines` work on the segments from `scan`. `ws-indent`, `ws-trailing` and `ws-blanklines` work line by line and
 use `lines_with_protection` to skip line edges that lie inside a protected segment.
 """
@@ -146,9 +147,7 @@ class StripIndentation(Transform):
     description = "Remove leading whitespace from each line."
 
     def apply(self, code: str) -> str:
-        return "\n".join(
-            line if starts_protected else line.lstrip() for line, starts_protected, _ in lines_with_protection(code)
-        )
+        return "\n".join(line if starts_protected else line.lstrip() for line, starts_protected, _ in lines_with_protection(code))
 
 
 class StripTrailingWhitespace(Transform):
@@ -159,9 +158,7 @@ class StripTrailingWhitespace(Transform):
     description = "Remove trailing whitespace from each line."
 
     def apply(self, code: str) -> str:
-        return "\n".join(
-            line if ends_protected else line.rstrip() for line, _, ends_protected in lines_with_protection(code)
-        )
+        return "\n".join(line if ends_protected else line.rstrip() for line, _, ends_protected in lines_with_protection(code))
 
 
 class CollapseBlankLines(Transform):

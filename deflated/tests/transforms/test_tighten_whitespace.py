@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
+from deflated.tests.transforms.random_c import PUNCTUATORS, lexed, pp_token, random_source
 from deflated.transforms import TightenWhitespace
 
 
@@ -346,9 +349,7 @@ class TestTightenWhitespace:
         # Only a whole word `L`, `u`, `U` or `u8` is a prefix, not the end of a longer name; a member `L` still is one.
         assert TightenWhitespace().apply(src) == expected
 
-    @pytest.mark.parametrize(
-        "src, expected", [('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'), ("c = u8'a';", "c=u8'a';")]
-    )
+    @pytest.mark.parametrize("src, expected", [('wcscpy(buf, L"text");', 'wcscpy(buf,L"text");'), ("c = u8'a';", "c=u8'a';")])
     def test_prefixed_literal_not_split(self, src, expected) -> None:
         assert TightenWhitespace().apply(src) == expected
 
@@ -368,3 +369,24 @@ class TestTightenWhitespace:
         # gluing risk, so the boundary is tightened normally.
         t = TightenWhitespace()
         assert t.apply("x ;  __asm { nop }") == "x;__asm { nop }"
+
+
+# Tokens `ws-tighten` may form from invalid code: `->*` (C++ only, `p-> *q` is invalid C++ too, see CODE_REVIEW 1.9),
+# `##` and `%:%:` (only meaningful in a directive, and directives are left unchanged) and `...` (CODE_REVIEW 6.4).
+# Without them they lex as shorter tokens on both sides, so a fusion into one is not counted.
+_INVALID_CODE_FUSIONS = {"->*", "##", "%:%:", "..."}
+_CODE_TOKEN = pp_token([p for p in PUNCTUATORS if p not in _INVALID_CODE_FUSIONS])
+
+
+class TestTightenWhitespaceProperty:
+    """Removing blanks must never change how the code lexes (the `ws-newlines` test in `test_join_lines.py`)."""
+
+    @pytest.mark.parametrize("seed", range(20))
+    def test_random_source_lexes_the_same_after_tightening(self, seed: int) -> None:
+        # Same tokens and segments (blanks ignored), directives unchanged, and idempotent.
+        rng = random.Random(seed)
+        for _ in range(300):
+            src = random_source(rng)
+            out = TightenWhitespace().apply(src)
+            assert lexed(out, _CODE_TOKEN) == lexed(src, _CODE_TOKEN), f"src={src!r} out={out!r}"
+            assert TightenWhitespace().apply(out) == out, f"src={src!r} out={out!r}"
