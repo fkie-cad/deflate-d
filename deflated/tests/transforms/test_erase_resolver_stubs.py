@@ -59,3 +59,16 @@ class TestEraseResolverStubs:
     def test_shape_inside_string_not_touched(self) -> None:
         src = 'const char *s = "i64 b(){i64 er=0;return a();}";'
         assert EraseResolverStubs().apply(src) == src
+
+    def test_stray_closing_brace_stops_the_scan(self) -> None:
+        # After a stray `}` it is unknown which definitions are top level. Reading on, the `{` would bring the depth
+        # back to 0 and the stubs inside that block would look like top-level functions and be deleted.
+        src = (
+            "} {\n"
+            "i64 a(){return 0;}\n"
+            "i64 b(){i64 er=0;return a();}\n"
+            "i64 c(){i64 er=1;return a();}\n"
+            "i64 d(){i64 er=2;return a();}\n"
+            "}"
+        )
+        assert EraseResolverStubs().apply(src) == src

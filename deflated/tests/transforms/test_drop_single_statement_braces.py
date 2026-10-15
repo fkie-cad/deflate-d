@@ -237,3 +237,8 @@ class TestDropSingleStatementBraces:
     def test_missing_closing_brace_tolerated(self) -> None:
         src = "if (c) { x = 1;"
         assert DropSingleStatementBraces().apply(src) == src
+
+    def test_stray_closer_in_body_kept(self) -> None:
+        # A stray `]` makes the body's statements unknown, so the braces stay.
+        src = "if (c) { a ] b; }"
+        assert DropSingleStatementBraces().apply(src) == src

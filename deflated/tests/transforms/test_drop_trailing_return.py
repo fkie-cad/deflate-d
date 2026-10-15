@@ -56,3 +56,9 @@ class TestDropTrailingReturn:
     def test_keeps_return_that_is_an_unbraced_body(self, src) -> None:
         # Dropping it would leave `if (c) }` / `else }`, which is invalid C.
         assert DropTrailingReturn().apply(src) == src
+
+    def test_stray_closing_brace_stops_the_scan(self) -> None:
+        # After a stray `}` the depth is unknown. Reading on would see the `}` of the `if` as the body end and drop
+        # the early return, so `y()` would run when `c` holds.
+        src = "}void f(void){if(c){x();return;}y();}"
+        assert DropTrailingReturn().apply(src) == src

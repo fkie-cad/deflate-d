@@ -14,7 +14,16 @@ from collections import Counter
 
 from .base import Tier, Transform
 from .contextual import _IDENT, _RESERVED
-from .ctokens import CINT, CNUMBER, ctokenize, match_delimiter, split_args
+from .ctokens import (
+    CINT,
+    CNUMBER,
+    ctokenize,
+    iter_depth,
+    match_delimiter,
+    match_delimiter_backward,
+    split_args,
+    split_top_level,
+)
 from .lexer import SegmentType, scan
 
 
@@ -640,7 +649,10 @@ class ElideThunkBodies(Transform):
         if not body or any(w in self._CTRL for w in body):
             return False
         decl = call = ret = None
-        for stmt in self._split_semis(body):
+        stmts = self._split_semis(body)
+        if stmts is None:
+            return False
+        for stmt in stmts:
             if not stmt:
                 continue
             if "(" in stmt:
@@ -658,24 +670,14 @@ class ElideThunkBodies(Transform):
         return call is not None and self._is_forward_call(call, name)
 
     @staticmethod
-    def _split_semis(body: list[str]) -> list[list[str]]:
-        """Split a body token list into statements at depth-0 ``;``."""
-        out: list[list[str]] = []
-        cur: list[str] = []
-        depth = 0
-        for tok in body:
-            if tok in "([{":
-                depth += 1
-            elif tok in ")]}":
-                depth -= 1
-            if tok == ";" and depth == 0:
-                out.append(cur)
-                cur = []
-            else:
-                cur.append(tok)
-        if cur:
-            out.append(cur)
-        return out
+    def _split_semis(body: list[str]) -> list[list[str]] | None:
+        """Split a body token list into statements at depth-0 ``;``, or None if it has a stray closer."""
+        spans = split_top_level(body, 0, len(body), {";"})
+        if spans is None:
+            return None
+        if spans and spans[-1][0] == spans[-1][1]:
+            spans.pop()  # nothing after the last `;`
+        return [body[lo:hi] for lo, hi in spans]
 
     @staticmethod
     def _is_simple_decl(stmt: list[str]) -> bool:
@@ -706,7 +708,7 @@ class ElideThunkBodies(Transform):
             return True
         # Indirect import thunk: `( *...PTR_... ) ( ...args... )` to the end.
         if c[0] == "(":
-            g = self._match(c, 0)
+            g = match_delimiter(c, 0)
             if g is None or g + 1 >= len(c) or c[g + 1] != "(":
                 return False
             group = c[1:g]
@@ -737,7 +739,10 @@ class ElideThunkBodies(Transform):
         """
         if params is None or not body or any(w in self._CTRL for w in body):
             return None
-        stmts = [s for s in self._split_semis(body) if s]
+        stmts = self._split_semis(body)
+        if stmts is None:
+            return None
+        stmts = [s for s in stmts if s]
         if len(stmts) != 1:
             return None
         s = stmts[0]
@@ -747,7 +752,7 @@ class ElideThunkBodies(Transform):
         if not _IDENT.fullmatch(callee) or callee == name or callee in _RESERVED or callee.startswith("PTR_"):
             return None
         c = s[1:]  # `WORKER ( ...args... )`
-        close = self._match(c, 1)
+        close = match_delimiter(c, 1)
         # Must span the whole statement and carry at least one argument.
         if close is None or close != len(c) - 1 or close <= 2:
             return None
@@ -755,6 +760,8 @@ class ElideThunkBodies(Transform):
         # function's parameters, verbatim and in order. Anything else (a constant,
         # a dereference, a reorder, a nested call) is distinguishing semantics.
         arg_lists = self._split_top_commas(c[2:close])
+        if arg_lists is None:
+            return None
         arg_idents = [a[0] if len(a) == 1 and _IDENT.fullmatch(a[0]) else None for a in arg_lists]
         if not params or arg_idents != params:
             return None
@@ -774,51 +781,31 @@ class ElideThunkBodies(Transform):
             j -= 1
         if j < 0:
             return None
-        depth, k = 0, j
-        while k >= 0:
-            t = toks[k][0]
-            if t == ")":
-                depth += 1
-            elif t == "(":
-                depth -= 1
-                if depth == 0:
-                    break
-            k -= 1
-        if k < 0:
+        k = match_delimiter_backward(toks, j)
+        if k is None:
             return None
         inner = [x[0] for x in toks[k + 1 : j]]
+        params = ElideThunkBodies._split_top_commas(inner)
+        if params is None:
+            return None
         names: list[str] = []
-        for param in ElideThunkBodies._split_top_commas(inner):
+        for param in params:
             ids = [t for t in param if _IDENT.fullmatch(t)]
             if ids:
                 names.append(ids[-1])
         return [] if names == ["void"] else names
 
     @staticmethod
-    def _split_top_commas(toks: list[str]) -> list[list[str]]:
-        """Split a flat token-string list on top-level ``,`` (``()[]{}``-aware)."""
-        out: list[list[str]] = []
-        depth = 0
-        cur: list[str] = []
-        for t in toks:
-            if t in "([{":
-                depth += 1
-            elif t in ")]}":
-                depth -= 1
-            elif t == "," and depth == 0:
-                out.append(cur)
-                cur = []
-                continue
-            cur.append(t)
-        if cur or out:
-            out.append(cur)
-        return out
+    def _split_top_commas(toks: list[str]) -> list[list[str]] | None:
+        """Split a flat token-string list on top-level ``,`` (``()[]{}``-aware), or None if it has a stray closer."""
+        spans = split_top_level(toks, 0, len(toks), {","})
+        return None if spans is None else [toks[lo:hi] for lo, hi in spans]
 
     @classmethod
     def _strip_leading_casts(cls, c: list[str]) -> list[str]:
         """Drop leading ``( type-spelling )`` casts (identifiers and ``*`` only)."""
         while len(c) > 1 and c[0] == "(":
-            close = cls._match(c, 0)
+            close = match_delimiter(c, 0)
             if close is None or close == len(c) - 1:
                 break  # this paren is the call's own arg list, not a cast
             inner = c[1:close]
@@ -832,22 +819,9 @@ class ElideThunkBodies(Transform):
         return c
 
     @staticmethod
-    def _match(c: list[str], i: int) -> int | None:
-        """Index of the ``)`` matching the ``(`` at ``c[i]``."""
-        depth = 0
-        for j in range(i, len(c)):
-            if c[j] == "(":
-                depth += 1
-            elif c[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    return j
-        return None
-
-    @classmethod
-    def _spans_to_end(cls, c: list[str], open_idx: int) -> bool:
+    def _spans_to_end(c: list[str], open_idx: int) -> bool:
         """True if the ``(`` at ``open_idx`` matches the final token of ``c``."""
-        close = cls._match(c, open_idx)
+        close = match_delimiter(c, open_idx)
         return close is not None and close == len(c) - 1
 
 
@@ -887,7 +861,8 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
     offset at which the signature begins (just past the previous top-level ``;``
     or ``}``), so a caller can delete the whole definition. Function bodies are
     skipped wholesale, so only depth-0 definitions are reported and nested braces
-    never confuse the scan.
+    never confuse the scan. A stray ``}`` ends the scan (see ``iter_depth``), so
+    no definition after it is reported and none is deleted.
 
     Handles the function-returning-function-pointer declarator decompilers emit
     for the ``__gmon_start__`` registration hook (``i64 (**init_proc())(void){``):
@@ -897,30 +872,20 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
     """
     n = len(toks)
     out: list[tuple[str, int, int, int, int]] = []
-    depth = 0
-    i = 0
     seg_start = toks[0][1] if toks else 0
-    while i < n:
-        t = toks[i][0]
-        if t == "{":
-            depth += 1
-            i += 1
+    skip_to = -1  # the index of the last token of the definition just found, whose tokens are not scanned again
+    for i, t, depth in iter_depth(toks, openers="{"):
+        if depth < 0:
+            break  # a stray `}`: which definitions are top level is unknown from here on
+        if i <= skip_to or depth != 0:
             continue
-        if t == "}":
-            depth -= 1
-            i += 1
-            if depth == 0:
-                seg_start = toks[i - 1][2]
-            continue
-        if depth == 0 and t == ";":
+        if t in ("}", ";"):
             seg_start = toks[i][2]
-            i += 1
             continue
         # A `(` immediately followed by `*` is a declarator grouping wrapping the
         # real name (`(**init_proc())`), not this token's parameter list.
         if (
-            depth == 0
-            and _IDENT.fullmatch(t)
+            _IDENT.fullmatch(t)
             and t not in _RESERVED
             and i + 1 < n
             and toks[i + 1][0] == "("
@@ -934,9 +899,7 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
                     if bc is not None:
                         out.append((t, seg_start, bo, bc, toks[bc][2]))
                         seg_start = toks[bc][2]
-                        i = bc + 1
-                        continue
-        i += 1
+                        skip_to = bc
     return out
 
 
@@ -1009,7 +972,10 @@ class EraseResolverStubs(Transform):
         if not body or any(w in ElideThunkBodies._CTRL for w in body):
             return None
         decl = call = None
-        for stmt in ElideThunkBodies._split_semis(body):
+        stmts = ElideThunkBodies._split_semis(body)
+        if stmts is None:
+            return None
+        for stmt in stmts:
             if not stmt:
                 continue
             if stmt[0] == "return":

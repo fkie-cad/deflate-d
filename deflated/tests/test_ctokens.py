@@ -6,10 +6,15 @@ import pytest
 
 from deflated.transforms.ctokens import (
     ctokenize,
+    first_top_level,
     has_top_level_token,
+    iter_depth,
     match_delimiter,
+    match_delimiter_backward,
     split_args,
     split_statements,
+    split_top_level,
+    top_level_indices,
     word_before,
 )
 
@@ -112,8 +117,11 @@ def test_member_access_is_not_a_number() -> None:
         # Trailing text without a delimiter still forms a final piece.
         ("x; y", ["x;", " y"]),
         ("", []),
-        # A stray `)` must not push depth negative and suppress later splits.
-        (") a; b;", [") a;", " b;"]),
+        # After a stray `)` or `]` the depth is unknown, so the rest stays one piece.
+        ("a; ) b; c;", ["a;", " ) b; c;"]),
+        ("a; ] b; c;", ["a;", " ] b; c;"]),
+        # Braces do not nest here, so a stray `}` is just another split point.
+        ("} a;", ["}", " a;"]),
         # An unclosed `(` keeps everything after it in one piece.
         ("f(a; b; c", ["f(a; b; c"]),
     ],
@@ -154,6 +162,39 @@ def test_match_delimiter(code: str, open_idx: int, expected: int | None) -> None
     assert match_delimiter(ctokenize(code), open_idx) == expected
 
 
+def test_match_delimiter_plain_strings() -> None:
+    # Plain token strings work the same as CTokens.
+    texts = [token.text for token in ctokenize("f(a, (b)) c")]
+    assert match_delimiter(texts, 1) == 7
+    assert match_delimiter_backward(texts, 7) == 1
+
+
+@pytest.mark.parametrize(
+    ("code", "close_idx", "lo_idx", "expected"),
+    [
+        #  0 1 2 3 4 5 6 7 8
+        # `f ( a , ( b ) ) c`: nested pairs of the same kind are skipped.
+        ("f(a, (b)) c", 7, 0, 1),
+        ("f(a, (b)) c", 6, 0, 4),
+        # Every bracket kind, and other kinds in between do not count.
+        ("a[(i]", 4, 0, 1),
+        ("{ ( }", 2, 0, 0),
+        # A delimiter in a string, char, or comment is opaque.
+        ('f(")") x)', 3, 0, 1),
+        # The search stops at lo_idx.
+        ("f(a, (b))", 7, 2, None),
+        ("f(a, (b))", 7, 1, 1),
+        # Not a closer, out of range, or never opened.
+        ("f(a)", 2, 0, None),
+        ("f(a)", 9, 0, None),
+        ("a)", 1, 0, None),
+        ("", 0, 0, None),
+    ],
+)
+def test_match_delimiter_backward(code: str, close_idx: int, lo_idx: int, expected: int | None) -> None:
+    assert match_delimiter_backward(ctokenize(code), close_idx, lo_idx) == expected
+
+
 @pytest.mark.parametrize(
     ("code", "lo_idx", "hi_idx", "token_texts", "expected"),
     [
@@ -173,8 +214,10 @@ def test_match_delimiter(code: str, open_idx: int, expected: int | None) -> None
         ("a /* , */ d", 0, 3, {","}, False),
         # Delimiters only change the depth and are never reported.
         ("(a)", 0, 3, {"(", ")"}, False),
-        # A stray closer does not push later tokens below depth 0.
+        # A stray closer makes the answer unknown, so the guard says yes, even with no target after it.
         ("a ] , b", 0, 4, {","}, True),
+        ("a ] b", 0, 3, {","}, True),
+        ("a , b ]", 0, 4, {"?"}, True),
         # The slice bounds are respected: the comma at index 1 is outside [2, 3).
         ("a , b", 2, 3, {","}, False),
         ("a , b", 1, 1, {","}, False),  # empty slice
@@ -203,8 +246,8 @@ def test_has_top_level_token(code: str, lo_idx: int, hi_idx: int, token_texts: s
         ("f(,)", 1, ["", ""]),
         # Only the tokens up to the matching closer are split.
         ("f(a, b) , c", 1, ["a", "b"]),
-        # A stray closer inside is kept in its item and does not hide later commas.
-        ("f(a ] , b)", 1, ["a]", "b"]),
+        # A stray closer of another kind inside makes the items unknown.
+        ("f(a ] , b)", 1, None),
         # Any opener works, not only a call's `(`.
         ("{a, b}", 0, ["a", "b"]),
         # A comma inside a string, char, or comment is opaque.
@@ -220,6 +263,91 @@ def test_split_args(code: str, open_idx: int, expected: list[str] | None) -> Non
     spans = split_args(t, open_idx)
     items = None if spans is None else ["".join(tok.text for tok in t[lo:hi]) for lo, hi in spans]
     assert items == expected
+
+
+def test_iter_depth() -> None:
+    # A delimiter sits at the depth outside its pair; ctokens may also be plain strings.
+    assert list(iter_depth(["f", "(", "a", "[", "i", "]", ")", "b"])) == [
+        (0, "f", 0),
+        (1, "(", 0),
+        (2, "a", 1),
+        (3, "[", 1),
+        (4, "i", 2),
+        (5, "]", 1),
+        (6, ")", 0),
+        (7, "b", 0),
+    ]
+
+
+def test_iter_depth_stray_closer() -> None:
+    # A stray closer is yielded at depth -1 and ends the walk, even if an opener follows.
+    assert list(iter_depth(["a", ")", "(", "b", ")"])) == [(0, "a", 0), (1, ")", -1)]
+    # A closer not in `openers` is an ordinary token and does not end it.
+    assert [depth for _, _, depth in iter_depth(["a", ")", "b"], openers="{")] == [0, 0, 0]
+
+
+def test_iter_depth_openers() -> None:
+    # Delimiters not in `openers` are ordinary tokens, so with braces only `(` does not nest.
+    texts = ["(", "{", "a", ")", "}"]
+    assert [depth for _, _, depth in iter_depth(texts, openers="{")] == [0, 0, 1, 1, 0]
+
+
+def test_iter_depth_slice_bounds() -> None:
+    # Depth is counted from lo_idx, and the bounds are clamped to the sequence.
+    texts = ["(", "a", ")"]
+    assert list(iter_depth(texts, 1)) == [(1, "a", 0), (2, ")", -1)]  # starting inside, the `)` is stray
+    assert list(iter_depth(texts, -3, 99)) == list(iter_depth(texts))
+
+
+@pytest.mark.parametrize(
+    ("code", "token_texts", "expected"),
+    [
+        ("a ; (b ; c) ; d", {";"}, [1, 7]),
+        ("a = b == c = d", {"="}, [1, 5]),  # whole tokens only
+        ("(a) , b", {"(", ")", ","}, [3]),  # delimiters are never reported
+        ("a ; b", {";"}, [1]),
+        ("a b", {";"}, []),
+        # A stray closer anywhere in the slice, before or after a match, makes the result unknown.
+        ("a ) ; b", {";"}, None),
+        ("a ; b )", {";"}, None),
+        ("a ) ( ; )", {";"}, None),  # an opener after it does not bring the depth back
+    ],
+)
+def test_top_level_indices(code: str, token_texts: set[str], expected: list[int] | None) -> None:
+    assert top_level_indices(ctokenize(code), 0, None, token_texts) == expected
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("a ; b ;", 1),
+        ("(a ; b) ; c", 5),
+        ("a b", None),
+        # A stray closer after the first match does not matter, so a search may run past its construct.
+        ("a ; } b", 1),
+        # Before the first match it does: the `;` after a stray `}` is not known to be top level.
+        ("a } ; b", None),
+        ("} { ; }", None),
+    ],
+)
+def test_first_top_level(code: str, expected: int | None) -> None:
+    assert first_top_level(ctokenize(code), 0, None, {";"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("texts", "lo_idx", "hi_idx", "expected"),
+    [
+        (["a", ",", "b"], 0, 3, [(0, 1), (2, 3)]),
+        (["a", ","], 0, 2, [(0, 1), (2, 2)]),  # a trailing separator leaves an empty item
+        ([","], 0, 1, [(0, 0), (1, 1)]),
+        (["a"], 0, 1, [(0, 1)]),
+        (["a"], 0, 0, []),  # only an empty slice yields no items
+        (["x", "a", ",", "b", "y"], 1, 4, [(1, 2), (3, 4)]),  # spans are indices into the whole sequence
+        (["a", ")", ",", "b"], 0, 4, None),  # a stray closer makes the items unknown
+    ],
+)
+def test_split_top_level(texts: list[str], lo_idx: int, hi_idx: int, expected: list[tuple[int, int]] | None) -> None:
+    assert split_top_level(texts, lo_idx, hi_idx, {","}) == expected
 
 
 def test_split_args_spans() -> None:

@@ -256,3 +256,30 @@ class TestCompoundAssignment:
         # Known miss, safe: the control header becomes part of the target. In the pipeline `compound-assign` runs
         # before `brace-elision`, so the body still has its braces (see test_t2.py).
         assert CompoundAssignment().apply("if (c) a = a + 1;") == "if (c) a = a + 1;"
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            # After a stray `)` the statements are unknown; before it they still fold.
+            ("a; ) b; x = x + 1;", "a; ) b; x = x + 1;"),
+            ("x = x + 1; ) y = y + 1;", "x += 1; ) y = y + 1;"),
+            # A stray `]` before the `=` hides which `=` is top level.
+            ("a ] = a ] + 1;", "a ] = a ] + 1;"),
+        ],
+    )
+    def test_stray_closer_not_folded(self, src, expected) -> None:
+        assert CompoundAssignment().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            # A stray closer in the remainder hides which of its operators are top level: `* z` must not be read as
+            # nested, or `x = x + y ) * z` would become `x += y ) * z`.
+            "x = x + y ) * z;",
+            "x = x + (y) ] * z;",
+            # A stray closer in a `case` label hides which `:` ends it, so the label is not skipped.
+            "case 1 ] : x = x + 1;",
+        ],
+    )
+    def test_stray_closer_in_remainder_or_label_not_folded(self, src) -> None:
+        assert CompoundAssignment().apply(src) == src

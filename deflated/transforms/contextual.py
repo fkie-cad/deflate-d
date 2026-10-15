@@ -259,16 +259,8 @@ class CompressFunctionNames(Transform):
             name = toks[i]
             if toks[i + 1] != "(" or not self._is_func.match(name):
                 continue
-            depth, j = 0, i + 1
-            while j < n:
-                if toks[j] == "(":
-                    depth += 1
-                elif toks[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            if depth == 0 and j + 1 < n and toks[j + 1] == "{" and name not in seen:
+            close = match_delimiter(toks, i + 1)
+            if close is not None and close + 1 < n and toks[close + 1] == "{" and name not in seen:
                 seen.add(name)
                 found.append(name)
         return found

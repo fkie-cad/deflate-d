@@ -10,19 +10,26 @@ skips any rewrite it cannot prove safe. A missed rewrite only costs size; a wron
 from __future__ import annotations
 
 import re
-from collections import defaultdict
-from itertools import groupby
-from typing import DefaultDict, Dict, List, Optional, Set, Tuple
+from bisect import bisect_left
+from collections import Counter, defaultdict
+from itertools import accumulate, groupby
+from typing import DefaultDict, List, Optional, Set, Tuple
 
 from .base import Tier, Transform
 from .ctokens import (
     CINT,
+    CLOSER_FOR,
     CNUMBER,
+    OPENER_FOR,
     CToken,
     ctokenize,
+    first_top_level,
     has_top_level_token,
+    iter_depth,
     match_delimiter,
+    match_delimiter_backward,
     split_statements,
+    top_level_indices,
 )
 from .lexer import SegmentType, scan, strip_comments
 
@@ -83,19 +90,6 @@ def _split_leading_labels(statement: str) -> Tuple[str, str]:
     ):
         prefix_length = label_match.end()
     return statement[:prefix_length], statement[prefix_length:]
-
-
-def _open_paren(tokens: List[CToken], start: int, close: int) -> Optional[int]:
-    """Return the index of the `(` that matches the `)` at `close`, searching back to `start`, or None."""
-    depth = 0
-    for index in range(close, start - 1, -1):
-        if tokens[index].text == ")":
-            depth += 1
-        elif tokens[index].text == "(":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
 
 
 class NormalizeFlagTemps(Transform):
@@ -266,7 +260,7 @@ class DropSingleStatementBraces(Transform):
             return False
         before = tokens[brace_index - 1].text
         if before == ")":
-            paren_index = _open_paren(tokens, 0, brace_index - 1)
+            paren_index = match_delimiter_backward(tokens, brace_index - 1)
             if paren_index is None or paren_index == 0:
                 return False
             # `switch` is left out: a body with a `case` label needs its braces (`switch(x)case 1:...` is invalid C)
@@ -416,15 +410,8 @@ class CompoundAssignment(Transform):
             if close_index is None:
                 continue
             # The two `;` of the header, at its own depth.
-            depth, semicolons = 0, []
-            for inner in range(index + 2, close_index):
-                if tokens[inner].text in ("(", "[", "{"):
-                    depth += 1
-                elif tokens[inner].text in (")", "]", "}"):
-                    depth -= 1
-                elif tokens[inner].text == ";" and depth == 0:
-                    semicolons.append(inner)
-            if len(semicolons) != 2:
+            semicolons = top_level_indices(tokens, index + 2, close_index, {";"})
+            if semicolons is None or len(semicolons) != 2:
                 continue
             # The increment clause without its surrounding whitespace, which stays untouched.
             start, end = tokens[semicolons[1]].end, tokens[close_index].start
@@ -474,25 +461,25 @@ class CompoundAssignment(Transform):
         while index + 1 < len(tokens):
             if tokens[index].text == "case":
                 # The `:` ending the label is the first one at depth 0 that closes no `?` and is not half of a `::`.
-                depth = open_questions = 0
+                # After a stray closer which `:` is top level is unknown, so the label is not skipped.
+                open_questions = 0
                 colon_index = None
-                inner = index + 1
-                while inner < len(tokens) and colon_index is None:
-                    text = tokens[inner].text
-                    if text in ("(", "[", "{"):
-                        depth += 1
-                    elif text in (")", "]", "}"):
-                        depth -= 1
+                after_double_colon = False
+                for inner, text, depth in iter_depth(tokens, index + 1):
+                    if depth < 0:
+                        break
+                    if after_double_colon:
+                        after_double_colon = False  # the second `:` of a `::`
                     elif depth == 0 and text == "?":
                         open_questions += 1
                     elif depth == 0 and text == ":":
                         if inner + 1 < len(tokens) and tokens[inner + 1].text == ":":
-                            inner += 1  # `::`
+                            after_double_colon = True
                         elif open_questions:
                             open_questions -= 1
                         else:
                             colon_index = inner
-                    inner += 1
+                            break
                 if colon_index is None:
                     break
                 index = colon_index + 1
@@ -509,15 +496,8 @@ class CompoundAssignment(Transform):
     @staticmethod
     def _assign_index(tokens: List[CToken]) -> int:
         """Return the index of the first top-level `=` token, or -1."""
-        depth = 0
-        for index, token in enumerate(tokens):
-            if token.text in ("(", "[", "{"):
-                depth += 1
-            elif token.text in (")", "]", "}"):
-                depth = max(0, depth - 1)
-            elif token.text == "=" and depth == 0:
-                return index
-        return -1
+        assign_index = first_top_level(tokens, 0, None, {"="})
+        return -1 if assign_index is None else assign_index
 
     @staticmethod
     def _pure_lvalue(lhs_texts: List[str]) -> bool:
@@ -542,25 +522,24 @@ class CompoundAssignment(Transform):
         operator (one where no operator is expected) belongs to its operand, and `->` and `.` are not split on.
         After a cast `(T)` an operand follows, so `-` in `(int)-b` is unary; `(x)-b` is not a cast (see `_is_cast`).
         """
-        depth = 0
         expects_operator = False
         # For each open bracket: its index, and whether it stood where an operand was expected (a possible cast).
         open_brackets: List[Tuple[int, bool]] = []
-        for index, token in enumerate(remainder_tokens):
-            if token.text in ("(", "[", "{"):
-                depth += 1
+        for index, text, depth in iter_depth(remainder_tokens):
+            if depth < 0:
+                return False  # a stray closer: which operators are top level is unknown
+            if text in CLOSER_FOR:  # an opener
                 open_brackets.append((index, not expects_operator))
                 expects_operator = False
-            elif token.text in (")", "]", "}"):
-                depth -= 1
-                open_index, operand_position = open_brackets.pop() if open_brackets else (index, False)
+            elif text in OPENER_FOR:  # a closer, which always has its opener on the stack here
+                open_index, operand_position = open_brackets.pop()
                 group_texts = [inner.text for inner in remainder_tokens[open_index + 1 : index]]
-                expects_operator = not (token.text == ")" and operand_position and _is_cast(group_texts))
-            elif not expects_operator and token.text in cls._PREFIX_OPS:
+                expects_operator = not (text == ")" and operand_position and _is_cast(group_texts))
+            elif not expects_operator and text in cls._PREFIX_OPS:
                 pass  # a prefix operator; its operand follows
-            elif depth == 0 and expects_operator and token.text in cls._PRECEDENCE:
-                binds_tighter = cls._PRECEDENCE[token.text] < cls._PRECEDENCE[operator]
-                if not (binds_tighter or (token.text == operator and operator in cls._ASSOCIATIVE_OPS)):
+            elif depth == 0 and expects_operator and text in cls._PRECEDENCE:
+                binds_tighter = cls._PRECEDENCE[text] < cls._PRECEDENCE[operator]
+                if not (binds_tighter or (text == operator and operator in cls._ASSOCIATIVE_OPS)):
                     return False
                 expects_operator = False
             else:
@@ -622,108 +601,169 @@ class InlineSingleUseTemps(Transform):
 
     The declaration `undefined8 uVar1;` is removed too. The fold only fires when the name occurs exactly as often as
     the assignment, the return and at most one uninitialized declaration account for, counted over the whole input, so
-    a name reused in another function blocks it. The two statements are adjacent, so nothing is reordered even if
-    `f()` has side effects. The store converts to the temporary's type, so if that differs from the function's return
-    type the fold keeps it as a cast: `return (T)f();`. Runs before `decl-coalesce`, so the declaration is still its
-    own statement.
+    a name reused in another function blocks it. The declaration only counts if it is in the same function as the
+    assignment, so a global (declared at file scope or `extern`) is never folded: its store is observable. The two
+    statements are adjacent, so nothing is reordered even if `f()` has side effects. The store converts to the
+    temporary's type, so if that differs from the function's return type the fold keeps it as a cast: `return (T)f();`.
+    Runs before `decl-coalesce`, so the declaration is still its own statement.
     """
 
     id = "inline-temps"
     tier = Tier.T2_STRUCTURAL
     description = "Inline a single-use spill temporary into its return."
 
-    _ASSIGN = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=\s*(.+);\s*$", re.S)
+    # `=(?!=)`, so `x == y;` is not read as an assignment.
+    _ASSIGN = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=(?!=)\s*(.+);\s*$", re.S)
     _RETURN = re.compile(r"^\s*return\s+([A-Za-z_]\w*)\s*;(\s*)$", re.S)
     _DECL = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_ ]*\s+\**(?P<name>[A-Za-z_]\w*)\s*;\s*$")
     # A function header `<return type> <name>(`; the return type is group 1.
     _HEADER = re.compile(r"^\s*(.*?)\b[A-Za-z_]\w*\s*\(", re.S)
     # Header words that are not part of the return type.
     _HEADER_NOISE = frozenset({"static", "inline", "extern", "__cdecl", "__stdcall", "__fastcall", "__thiscall"})
+    # Declaration words that are not part of the temp's type, so they stay out of the cast.
+    _STORAGE_CLASS = frozenset({"static", "register"})
 
     def apply(self, code: str) -> str:
-        """
-        Return `code` with every single-use temporary inlined into its `return`.
-        """
-        name_counts: Dict[str, int] = {}
-        for seg_type, text in scan(code):
-            if seg_type == SegmentType.CODE:
-                for name_match in re.finditer(r"[A-Za-z_]\w*", text):
-                    name_counts[name_match.group(0)] = name_counts.get(name_match.group(0), 0) + 1
-
+        """Return `code` with every single-use temporary inlined into its `return`."""
+        name_counts = self._name_counts(code)
         pieces = split_statements(code)
-        piece_count = len(pieces)
-        keep = [True] * piece_count
-
-        # Single-name declarations by name. The first word must not be a keyword, or `return x;` would declare `x`.
-        decl_indices_by_name: DefaultDict[str, List[int]] = defaultdict(list)
-        for index, piece in enumerate(pieces):
-            decl_match = self._DECL.match(piece)
-            # Storing to and loading from a `volatile` temp is observable. Not recording its declaration makes the use
-            # count wrong, which blocks the fold.
-            if decl_match and piece.split()[0] not in (_STMT_KW | _CTRL_KW) and "volatile" not in piece.split():
-                decl_indices_by_name[decl_match.group("name")].append(index)
+        # Offsets into `code`, taken before any piece is rewritten.
+        piece_starts = list(accumulate((len(piece) for piece in pieces), initial=0))[:-1]
+        scopes = self._scopes(code, piece_starts)
+        decl_indices_by_name = self._declarations(pieces)
+        keep = [True] * len(pieces)
 
         index = 0
-        while index < piece_count - 1:
+        while index < len(pieces) - 1:
             assign_match = self._ASSIGN.match(pieces[index])
             return_match = self._RETURN.match(pieces[index + 1])
-            if (
-                keep[index]
-                and keep[index + 1]
-                and assign_match
-                and return_match
-                and assign_match.group(2) == return_match.group(1)
-            ):
-                name, expr = assign_match.group(2), assign_match.group(3)
-                decl_indices = decl_indices_by_name.get(name, [])
-                expected_count = 2 + (1 if len(decl_indices) == 1 else 0)
-                # Look for a self-reference in code only, like the counts above, so `f("uVar1")` does not block the
-                # fold.
-                expr_code = "".join(text for seg_type, text in scan(expr) if seg_type == SegmentType.CODE)
-                if (
-                    name_counts.get(name, 0) == expected_count
-                    and len(decl_indices) <= 1
-                    and not re.search(r"\b" + re.escape(name) + r"\b", expr_code)
-                ):
-                    value = expr.strip()
-                    if decl_indices:
-                        # The store into the temp converts to its type: keep that as a cast unless the function returns
-                        # the same type anyway.
-                        declaration = pieces[decl_indices[0]]
-                        temp_type = declaration[: self._DECL.match(declaration).start("name")].strip()
-                        return_type = self._return_type(code, sum(len(piece) for piece in pieces[:index]))
-                        if return_type is None or self._squash(return_type) != self._squash(temp_type):
-                            value = f"({temp_type}){self._as_operand(value)}"
-                    pieces[index] = f"{assign_match.group(1)}return {value};{return_match.group(2)}"
-                    keep[index + 1] = False
-                    if decl_indices:
-                        keep[decl_indices[0]] = False
-                    index += 2
-                    continue
-            index += 1
+            if not (assign_match and return_match and assign_match.group(2) == return_match.group(1)):
+                index += 1
+                continue
+            name, expr = assign_match.group(2), assign_match.group(3)
+            # A declaration in another scope (a global) does not count, so its name occurs once too often.
+            decl_indices = [
+                decl_index for decl_index in decl_indices_by_name.get(name, []) if scopes[decl_index] == scopes[index]
+            ]
+            if len(decl_indices) > 1 or not self._is_single_use(name, expr, name_counts[name] - len(decl_indices)):
+                index += 1
+                continue
+            value = expr.strip()
+            if decl_indices:
+                keep[decl_indices[0]] = False
+                temp_type = self._temp_type(pieces[decl_indices[0]])
+                value = self._converted(value, temp_type, self._return_type(code, piece_starts[index]))
+            pieces[index] = f"{assign_match.group(1)}return {value};{return_match.group(2)}"
+            keep[index + 1] = False
+            index += 2
         return "".join(piece for index, piece in enumerate(pieces) if keep[index])
+
+    @staticmethod
+    def _name_counts(code: str) -> Counter:
+        """Count each identifier in the code segments of `code`, so names in strings and comments are not counted."""
+        return Counter(
+            name
+            for seg_type, text in scan(code)
+            if seg_type == SegmentType.CODE
+            for name in re.findall(r"[A-Za-z_]\w*", text)
+        )
+
+    @classmethod
+    def _declarations(cls, pieces: List[str]) -> DefaultDict[str, List[int]]:
+        """
+        Return the indices of the single-name, uninitialized declarations in `pieces`, by declared name.
+
+        The first word must not be a keyword, or `return x;` would declare `x`. Storing to and loading from a
+        `volatile` temp or an `extern` global is observable. Not recording its declaration makes the use count wrong,
+        which blocks the fold.
+        """
+        decl_indices_by_name: DefaultDict[str, List[int]] = defaultdict(list)
+        for index, piece in enumerate(pieces):
+            decl_match = cls._DECL.match(piece)
+            if decl_match is None:
+                continue
+            words = piece.split()
+            if words[0] not in (_STMT_KW | _CTRL_KW) and "volatile" not in words and "extern" not in words:
+                decl_indices_by_name[decl_match.group("name")].append(index)
+        return decl_indices_by_name
+
+    @staticmethod
+    def _is_single_use(name: str, expr: str, use_count: int) -> bool:
+        """
+        True if `name = expr;` can fold into `return name;`: `name` occurs in nothing but those two statements, which
+        `use_count` (its occurrences outside its declaration) shows, and `expr` stays the same value once returned.
+        """
+        # Look for a self-reference in code only, like the counts, so `f("uVar1")` does not block the fold.
+        expr_code = "".join(text for seg_type, text in scan(expr) if seg_type == SegmentType.CODE)
+        expr_tokens = ctokenize(expr)
+        return (
+            use_count == 2
+            and not re.search(r"\b" + re.escape(name) + r"\b", expr_code)
+            # `x = a, g();` is `(x = a), g();`: returning the whole right side would return `g()`.
+            and not has_top_level_token(expr_tokens, 0, len(expr_tokens), frozenset({","}))
+        )
+
+    @classmethod
+    def _temp_type(cls, declaration: str) -> str:
+        """Return the type in `declaration`, without storage-class words: `static char *p;` -> `char *`."""
+        type_text = declaration[: cls._DECL.match(declaration).start("name")]
+        return " ".join(word for word in type_text.split() if word not in cls._STORAGE_CLASS)
+
+    @classmethod
+    def _converted(cls, value: str, temp_type: str, return_type: Optional[str]) -> str:
+        """
+        Return `value` as the temp holds it. The store into the temp converts to its type: keep that as a cast unless
+        the function returns the same type anyway.
+        """
+        if return_type is not None and cls._squash(return_type) == cls._squash(temp_type):
+            return value
+        return f"({temp_type}){cls._as_operand(value)}"
+
+    @staticmethod
+    def _scopes(code: str, offsets: List[int]) -> List[Optional[int]]:
+        """
+        For each of the ascending `offsets`, return the index of the top-level `{...}` block (the function body)
+        that contains it, or None if it is at file scope. After a stray `}` the scope is unknown, so each offset there
+        gets a negative value of its own that equals no other scope.
+        """
+        tokens = ctokenize(code)
+        # The top-level block still open after each token, or None at file scope.
+        open_after: List[Optional[int]] = []
+        block = -1
+        for _, text, depth in iter_depth(tokens, openers="{"):
+            if depth < 0:
+                break  # a stray `}`: the scope of everything from here on is unknown
+            if text == "{" and depth == 0:
+                block += 1
+            open_after.append(block if text == "{" or depth > 0 else None)
+        token_starts = [token.start for token in tokens]
+        scopes: List[Optional[int]] = []
+        for position, offset in enumerate(offsets):
+            before = bisect_left(token_starts, offset)  # the number of tokens that start before `offset`
+            if before > len(open_after):
+                scopes.append(-1 - position)  # past a stray `}`: a scope of its own, equal to no other
+            else:
+                scopes.append(open_after[before - 1] if before else None)
+        return scopes
 
     @classmethod
     def _return_type(cls, code: str, offset: int) -> Optional[str]:
-        """
-        Return the declared return type of the function whose body contains `offset`, or None if not found.
-        """
-        depth, header_start = 0, 0
+        """Return the declared return type of the function whose body contains `offset`, or None if not found."""
+        # `header` is the text before the top-level `{` that is still open, so it is the enclosing function's at any
+        # depth; a top-level `}` or `;` ends the previous item, and the next header starts after it.
+        tokens = ctokenize(code)
+        header_start = 0
         header: Optional[str] = None
-        for token in ctokenize(code):
-            if token.start >= offset:
+        for index, text, depth in iter_depth(tokens, openers="{"):
+            if tokens[index].start >= offset:
                 break
-            if token.text == "{":
-                if depth == 0:
-                    header = code[header_start : token.start]
-                depth += 1
-            elif token.text == "}":
-                depth -= 1
-                if depth == 0:
-                    header_start, header = token.end, None
-            elif token.text == ";" and depth == 0:
-                header_start = token.end
-        if depth != 1 or header is None:
+            if depth != 0:
+                continue
+            if text == "{":
+                header = code[header_start : tokens[index].start]
+            elif text in ("}", ";"):
+                header_start, header = tokens[index].end, None
+        if header is None:
             return None
         header = "\n".join(line for line in strip_comments(header).splitlines() if not line.lstrip().startswith("#"))
         header_match = cls._HEADER.match(header)
@@ -741,9 +781,7 @@ class InlineSingleUseTemps(Transform):
 
     @staticmethod
     def _as_operand(expr: str) -> str:
-        """
-        Return `expr` as a cast operand: unchanged if it is one token or a call, else parenthesised.
-        """
+        """Return `expr` as a cast operand: unchanged if it is one token or a call, else parenthesised."""
         tokens = ctokenize(expr)
         if len(tokens) == 1:
             return expr
@@ -871,20 +909,12 @@ class TernaryFromIfElse(Transform):
         """
         if end > start and tokens[end - 1].text == ";":
             end -= 1
-        depth, assign_index = 0, None
-        for index in range(start, end):
-            text = tokens[index].text
-            if text in "([{":
-                depth += 1
-            elif text in ")]}":
-                depth -= 1
-            elif depth == 0 and text == ";":
-                return None  # more than one statement
-            elif depth == 0 and text == "=":
-                if assign_index is not None:
-                    return None  # chained assignment
-                assign_index = index
-        if assign_index is None or assign_index == start or assign_index + 1 >= end:
+        # Exactly one top-level `=` and no `;`: not more than one statement, and not a chained assignment.
+        top_level = top_level_indices(tokens, start, end, {";", "="})
+        if top_level is None or len(top_level) != 1 or tokens[top_level[0]].text != "=":
+            return None
+        assign_index = top_level[0]
+        if assign_index == start or assign_index + 1 >= end:
             return None
         return start, assign_index, assign_index + 1, end
 
@@ -907,17 +937,10 @@ class TernaryFromIfElse(Transform):
             if close is None:
                 return None
             return cls._parse_assign(tokens, start + 1, close), close + 1, tokens[close].end
-        depth, index = 0, start
-        while index < token_count:
-            text = tokens[index].text
-            if text in "([{":
-                depth += 1
-            elif text in ")]}":
-                depth -= 1
-            elif depth == 0 and text == ";":
-                return cls._parse_assign(tokens, start, index), index + 1, tokens[index].end
-            index += 1
-        return None
+        index = first_top_level(tokens, start, None, {";"})
+        if index is None:
+            return None
+        return cls._parse_assign(tokens, start, index), index + 1, tokens[index].end
 
     @classmethod
     def _has_update(cls, tokens: List[CToken], start: int, end: int) -> bool:
@@ -939,7 +962,7 @@ class TernaryFromIfElse(Transform):
             if before == "]" or (_IDENT_RX.match(before) and before not in _NONVALUE_KW):
                 return True
             if before == ")":
-                opener = _open_paren(tokens, start, index - 1)
+                opener = match_delimiter_backward(tokens, index - 1, start)
                 if opener is not None and tokens[opener + 1].text == "*":
                     return True
         return False
@@ -1181,25 +1204,20 @@ class DropTrailingReturn(Transform):
         Return `code` without the redundant `return;` at the end of each function body.
         """
         tokens = ctokenize(code)
-        depth = 0
         edits: List[Tuple[int, int]] = []
-        for index, token in enumerate(tokens):
-            if token.text == "{":
-                depth += 1
-            elif token.text == "}":
-                depth -= 1
-                # A function body closes when the depth is back to 0. If it ends in `return ;`, that return is
-                # redundant, unless it is the unbraced body of `if (c)`, `else`, `for (...)` or `while (...)`, or of a
-                # label (`done: return; }`). Dropping it would leave `if (c) }` or `done: }`, so it must follow `;`, `{`
-                # or `}`.
-                if (
-                    depth == 0
-                    and index >= 3
-                    and tokens[index - 1].text == ";"
-                    and tokens[index - 2].text == "return"
-                    and tokens[index - 3].text in (";", "{", "}")
-                ):
-                    edits.append((tokens[index - 2].start, tokens[index - 1].end))
+        for index, text, depth in iter_depth(tokens, openers="{"):
+            # A function body closes with a `}` at depth 0. If it ends in `return ;`, that return is redundant, unless
+            # it is the unbraced body of `if (c)`, `else`, `for (...)` or `while (...)`, or of a label
+            # (`done: return; }`). Dropping it would leave `if (c) }` or `done: }`, so it must follow `;`, `{` or `}`.
+            if (
+                text == "}"
+                and depth == 0
+                and index >= 3
+                and tokens[index - 1].text == ";"
+                and tokens[index - 2].text == "return"
+                and tokens[index - 3].text in (";", "{", "}")
+            ):
+                edits.append((tokens[index - 2].start, tokens[index - 1].end))
         for start, end in reversed(edits):
             code = code[:start] + code[end:]
         return code
