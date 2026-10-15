@@ -12,10 +12,11 @@ from __future__ import annotations
 import itertools
 import re
 import string
+from typing import Callable
 
 from .base import Tier, Transform
-from .ctokens import CINT, CNUMBER, ctokenize, match_delimiter
-from .lexer import SegmentType, scan
+from .ctokens import CINT, CNUMBER, apply_edits, ctokenize, match_delimiter
+from .lexer import SegmentType, iter_code_matches, map_code, scan
 
 # Keywords/types we must never hand out as a generated short name.
 _RESERVED = {
@@ -65,6 +66,8 @@ _RESERVED = {
 }
 
 _IDENT = re.compile(r"[A-Za-z_]\w*")
+# A crude token: an identifier or any single non-space character.
+_IDENT_OR_CHAR = re.compile(r"[A-Za-z_]\w*|\S")
 
 
 def _after_member_op(text: str, start: int) -> bool:
@@ -147,6 +150,36 @@ def _short_names(used: set[str]):
             yield cand
 
 
+def _rename(
+    segments: list[tuple[str, str]],
+    mapping: dict[str, str],
+    keep: Callable[[str, int, int], bool] | None = None,
+) -> str:
+    """Join `segments` back into code, with each whole-word name in `mapping` renamed in the `CODE` segments.
+
+    ``keep(text, start, pos)`` can veto a rename: it gets the segment text, the match start in it, and the match
+    position in the whole code.
+    """
+    if not mapping:
+        return "".join(text for _seg_type, text in segments)
+    names = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
+    out: list[str] = []
+    offset = 0
+    for seg_type, text in segments:
+        if seg_type == SegmentType.CODE:
+
+            def rename(m: re.Match, _text: str = text, _base: int = offset) -> str:
+                if keep is not None and keep(_text, m.start(), _base + m.start()):
+                    return m.group(0)
+                return mapping[m.group(0)]
+
+            out.append(names.sub(rename, text))
+        else:
+            out.append(text)
+        offset += len(text)
+    return "".join(out)
+
+
 class CompressFunctionNames(Transform):
     """Rename decompiler placeholder *function* names defined in this file.
 
@@ -218,40 +251,19 @@ class CompressFunctionNames(Transform):
         if not targets:
             return code
 
-        existing = {
-            m.group(0) for seg_type, text in segments if seg_type == SegmentType.CODE for m in _IDENT.finditer(text)
-        }
+        existing = {m.group(0) for m in iter_code_matches(segments, _IDENT)}
         gen = _short_names(used=set(existing))
         mapping = {name: next(gen) for name in targets}
-
-        big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
-        return "".join(
-            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text)
-            for seg_type, text in segments
-        )
+        return _rename(segments, mapping)
 
     def _all_placeholder_funcs(self, segments: list[tuple[str, str]]) -> list[str]:
         """Every placeholder function name anywhere (def, prototype, or call)."""
-        found: list[str] = []
-        seen: set[str] = set()
-        for seg_type, text in segments:
-            if seg_type != SegmentType.CODE:
-                continue
-            for m in _IDENT.finditer(text):
-                name = m.group(0)
-                if name not in seen and self._is_func.match(name):
-                    seen.add(name)
-                    found.append(name)
-        return found
+        names = (m.group(0) for m in iter_code_matches(segments, _IDENT))
+        return [name for name in dict.fromkeys(names) if self._is_func.match(name)]
 
     def _defined_functions(self, segments: list[tuple[str, str]]) -> list[str]:
         """Names with an in-file definition (``NAME(...) {``), first-seen order."""
-        toks = [
-            m.group(0)
-            for seg_type, text in segments
-            if seg_type == SegmentType.CODE
-            for m in re.finditer(r"[A-Za-z_]\w*|\S", text)
-        ]
+        toks = [m.group(0) for m in iter_code_matches(segments, _IDENT_OR_CHAR)]
         found: list[str] = []
         seen: set[str] = set()
         n = len(toks)
@@ -394,8 +406,10 @@ class CompressPlaceholderNames(Transform):
         segments = scan(code)
         struct_spans = _struct_body_spans(code)
 
-        def in_struct_body(pos: int) -> bool:
-            return any(lo <= pos < hi for lo, hi in struct_spans)
+        def is_field(text: str, start: int, pos: int) -> bool:
+            # Two kinds of real, source-derived names that merely spell like placeholders: a member access
+            # (`p->local_18`, `regs.eax`) and a field/enumerator declared inside a `struct`/`union`/`enum` body.
+            return _after_member_op(text, start) or any(lo <= pos < hi for lo, hi in struct_spans)
 
         existing: set[str] = set()
         placeholders: list[str] = []
@@ -405,17 +419,9 @@ class CompressPlaceholderNames(Transform):
                 for match in _IDENT.finditer(text):
                     name = match.group(0)
                     existing.add(name)
-                    # Skip two kinds of real, source-derived names that merely spell
-                    # like placeholders: a member access (`p->local_18`, `regs.eax`)
-                    # and a field/enumerator declared inside a `struct`/`union`/`enum`
-                    # body. Both are neither renamed nor counted as a placeholder
-                    # occurrence, so the unit stays internally consistent (a field's
-                    # declaration and its `->field` uses keep the same spelling).
-                    if (
-                        self._is_placeholder.match(name)
-                        and not _after_member_op(text, match.start())
-                        and not in_struct_body(offset + match.start())
-                    ):
+                    # A field is neither renamed nor counted as a placeholder occurrence, so the unit stays
+                    # internally consistent (a field's declaration and its `->field` uses keep the same spelling).
+                    if self._is_placeholder.match(name) and not is_field(text, match.start(), offset + match.start()):
                         placeholders.append(name)
             offset += len(text)
 
@@ -426,25 +432,7 @@ class CompressPlaceholderNames(Transform):
 
         gen = _short_names(used=set(existing))
         mapping = {name: next(gen) for name in unique}
-
-        big = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in mapping) + r")\b")
-
-        out: list[str] = []
-        offset = 0
-        for seg_type, text in segments:
-            if seg_type == SegmentType.CODE:
-                base = offset
-
-                def rename(m: re.Match, _text: str = text, _base: int = base) -> str:
-                    if _after_member_op(_text, m.start()) or in_struct_body(_base + m.start()):
-                        return m.group(0)
-                    return mapping[m.group(0)]
-
-                out.append(big.sub(rename, text))
-            else:
-                out.append(text)
-            offset += len(text)
-        return "".join(out), dict(mapping)
+        return _rename(segments, mapping, keep=is_field), dict(mapping)
 
 
 class SimplifyLowConfidenceTypes(Transform):
@@ -574,7 +562,7 @@ class SimplifyLowConfidenceTypes(Transform):
                 text = rx.sub(repl, text)
             return text
 
-        return "".join(fix(t) if seg_type == SegmentType.CODE else t for seg_type, t in scan(code))
+        return map_code(code, fix)
 
 
 class DropNullPointerCast(Transform):
@@ -649,7 +637,7 @@ class DropNullPointerCast(Transform):
     def apply(self, code: str) -> str:
         toks = ctokenize(code)
         n = len(toks)
-        edits: list[tuple[int, int]] = []
+        edits: list[tuple[int, int, str]] = []
         i = 0
         while i < n:
             if toks[i][0] != "(":
@@ -702,11 +690,9 @@ class DropNullPointerCast(Transform):
                     if outer_after is not None and outer_after not in self._SAFE_AFTER:
                         i += 1
                         continue
-            edits.append((toks[i][1], toks[null_idx][2]))
+            edits.append((toks[i][1], toks[null_idx][2], "0"))
             i = null_idx + 1
-        for lo, hi in reversed(edits):
-            code = code[:lo] + "0" + code[hi:]
-        return code
+        return apply_edits(code, edits)
 
 
 class AddressOfIndexToOffset(Transform):
@@ -777,9 +763,7 @@ class AddressOfIndexToOffset(Transform):
                     i = close + 1
                     continue
             i += 1
-        for lo, hi, rep in reversed(edits):
-            code = code[:lo] + rep + code[hi:]
-        return code
+        return apply_edits(code, edits)
 
 
 class StripPointerSlotAddress(Transform):
@@ -807,10 +791,7 @@ class StripPointerSlotAddress(Transform):
 
     def apply(self, code: str) -> str:
         segments = scan(code)
-        names: set[str] = set()
-        for seg_type, text in segments:
-            if seg_type == SegmentType.CODE:
-                names.update(m.group(0) for m in _IDENT.finditer(text))
+        names = {m.group(0) for m in iter_code_matches(segments, _IDENT)}
         # Group candidates by their stripped form to detect collisions.
         by_stripped: dict[str, list[str]] = {}
         for name in names:
@@ -822,11 +803,7 @@ class StripPointerSlotAddress(Transform):
         }
         if not mapping:
             return code
-        big = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in mapping) + r")\b")
-        return "".join(
-            (big.sub(lambda m: mapping[m.group(0)], text) if seg_type == SegmentType.CODE else text)
-            for seg_type, text in segments
-        )
+        return _rename(segments, mapping)
 
 
 class TrimPieceAccessSuffix(Transform):
@@ -847,6 +824,4 @@ class TrimPieceAccessSuffix(Transform):
     _RX = re.compile(r"((?:\.|->)\s*_[0-9a-fA-F]+_[0-9a-fA-F]+)_(?!\w)")
 
     def apply(self, code: str) -> str:
-        return "".join(
-            (self._RX.sub(r"\1", text) if seg_type == SegmentType.CODE else text) for seg_type, text in scan(code)
-        )
+        return map_code(code, lambda text: self._RX.sub(r"\1", text))

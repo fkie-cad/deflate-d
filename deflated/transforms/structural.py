@@ -22,6 +22,7 @@ from .ctokens import (
     CNUMBER,
     OPENER_FOR,
     CToken,
+    apply_edits,
     ctokenize,
     first_top_level,
     has_top_level_token,
@@ -31,7 +32,7 @@ from .ctokens import (
     split_statements,
     top_level_indices,
 )
-from .lexer import SegmentType, scan, strip_comments
+from .lexer import SegmentType, iter_code_matches, map_code, scan, strip_comments
 
 # Keywords that start a control statement, so a block body starting with one is not a single simple statement.
 _CTRL_KW = frozenset({"if", "for", "while", "do", "switch", "else"})
@@ -59,6 +60,7 @@ _LABEL_PREFIX = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*")
 # An identifier, and the keywords that may stand before a unary `*` and are never an operand value. (Numbers are
 # matched with `CINT`.)
 _IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
+_IDENT = re.compile(r"[A-Za-z_]\w*")
 _NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
@@ -109,10 +111,7 @@ class NormalizeFlagTemps(Transform):
 
     def apply(self, code: str) -> str:
         """Return `code` with every `cond:N` in code renamed to `condN`."""
-        return "".join(
-            (self._FLAG_TEMP.sub(r"cond\1", text) if seg_type == SegmentType.CODE else text)
-            for seg_type, text in scan(code)
-        )
+        return map_code(code, lambda text: self._FLAG_TEMP.sub(r"cond\1", text))
 
 
 class RemoveComments(Transform):
@@ -421,9 +420,7 @@ class CompoundAssignment(Transform):
             folded = self._fold(code[start:end])
             if folded is not None:
                 edits.append((start, end, folded))
-        for start, end, text in reversed(edits):
-            code = code[:start] + text + code[end:]
-        return code
+        return apply_edits(code, edits)
 
     def _fold(self, statement: str) -> Optional[str]:
         """
@@ -625,7 +622,7 @@ class InlineSingleUseTemps(Transform):
 
     def apply(self, code: str) -> str:
         """Return `code` with every single-use temporary inlined into its `return`."""
-        name_counts = self._name_counts(code)
+        name_counts: Counter = self._name_counts(code)
         pieces = split_statements(code)
         # Offsets into `code`, taken before any piece is rewritten.
         piece_starts = list(accumulate((len(piece) for piece in pieces), initial=0))[:-1]
@@ -661,12 +658,7 @@ class InlineSingleUseTemps(Transform):
     @staticmethod
     def _name_counts(code: str) -> Counter:
         """Count each identifier in the code segments of `code`, so names in strings and comments are not counted."""
-        return Counter(
-            name
-            for seg_type, text in scan(code)
-            if seg_type == SegmentType.CODE
-            for name in re.findall(r"[A-Za-z_]\w*", text)
-        )
+        return Counter(m.group(0) for m in iter_code_matches(scan(code), _IDENT))
 
     @classmethod
     def _declarations(cls, pieces: List[str]) -> DefaultDict[str, List[int]]:
@@ -830,10 +822,7 @@ class TernaryFromIfElse(Transform):
         Return `code` with every foldable if/else written as a ternary. One pass is enough: a folded branch holds a
         top-level `?`, which `_TERNARY_UNSAFE` rejects, so a fold never enables an enclosing one.
         """
-        # Collect every disjoint fold in one tokenization and apply them right to left, so earlier offsets stay valid.
-        for start, end, replacement in reversed(self._folds(code)):
-            code = code[:start] + replacement + code[end:]
-        return code
+        return apply_edits(code, self._folds(code))
 
     def _folds(self, code: str) -> List[Tuple[int, int, str]]:
         """
@@ -1036,12 +1025,7 @@ class CanonicalizeControlFlow(Transform):
         Return `code` without the labels that no `goto` or `&&` refers to.
         """
         referenced = {
-            name
-            for seg_type, text in scan(code)
-            if seg_type == SegmentType.CODE
-            for ref_match in self._LABEL_REF.finditer(text)
-            for name in ref_match.groups()
-            if name
+            name for ref_match in iter_code_matches(scan(code), self._LABEL_REF) for name in ref_match.groups() if name
         }
         transformed_pieces: List[str] = []
         for piece in split_statements(code):
@@ -1089,18 +1073,7 @@ class MinimizeIntegerLiterals(Transform):
             decimal = str(value)
             if len(decimal) < len(hex_digits):
                 edits.append((token.start, token.end, decimal + suffix))
-        if not edits:
-            return code
-        # Build the result in one forward pass: a hex-heavy file has thousands of edits, and slicing per edit is
-        # quadratic.
-        transformed_parts: List[str] = []
-        copied_up_to = 0
-        for start, end, replacement in edits:
-            transformed_parts.append(code[copied_up_to:start])
-            transformed_parts.append(replacement)
-            copied_up_to = end
-        transformed_parts.append(code[copied_up_to:])
-        return "".join(transformed_parts)
+        return apply_edits(code, edits)
 
 
 class DerefOffsetToIndex(Transform):
@@ -1157,9 +1130,7 @@ class DerefOffsetToIndex(Transform):
                             index = close + 1
                             continue
             index += 1
-        for start, end, replacement in reversed(edits):
-            code = code[:start] + replacement + code[end:]
-        return code
+        return apply_edits(code, edits)
 
     @staticmethod
     def _index_form(inner: List[str]) -> Optional[str]:
@@ -1204,7 +1175,7 @@ class DropTrailingReturn(Transform):
         Return `code` without the redundant `return;` at the end of each function body.
         """
         tokens = ctokenize(code)
-        edits: List[Tuple[int, int]] = []
+        edits: List[Tuple[int, int, str]] = []
         for index, text, depth in iter_depth(tokens, openers="{"):
             # A function body closes with a `}` at depth 0. If it ends in `return ;`, that return is redundant, unless
             # it is the unbraced body of `if (c)`, `else`, `for (...)` or `while (...)`, or of a label
@@ -1217,7 +1188,5 @@ class DropTrailingReturn(Transform):
                 and tokens[index - 2].text == "return"
                 and tokens[index - 3].text in (";", "{", "}")
             ):
-                edits.append((tokens[index - 2].start, tokens[index - 1].end))
-        for start, end in reversed(edits):
-            code = code[:start] + code[end:]
-        return code
+                edits.append((tokens[index - 2].start, tokens[index - 1].end, ""))
+        return apply_edits(code, edits)

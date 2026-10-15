@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from deflated.transforms.ctokens import (
+    apply_edits,
     ctokenize,
     first_top_level,
     has_top_level_token,
@@ -385,3 +386,20 @@ def test_split_args_spans() -> None:
 def test_word_before(code: str, end_idx: int, expected: str) -> None:
     code_chars = [ch for ch in code if not ch.isspace()]
     assert word_before(code_chars, end_idx) == expected
+
+
+@pytest.mark.parametrize(
+    "edits, expected",
+    [
+        ([], "abcdef"),
+        ([(1, 2, "X"), (4, 5, "")], "aXcdf"),  # replace and delete
+        ([(4, 5, ""), (1, 2, "X")], "aXcdf"),  # any order
+        ([(3, 3, "-")], "abc-def"),  # zero-width insert
+        ([(0, 6, "Z")], "Z"),
+        ([(1, 5, "O"), (2, 3, "I")], "aOf"),  # overlap: the earlier-starting edit wins
+        ([(2, 3, "I"), (1, 5, "O")], "aOf"),
+        ([(1, 3, "L"), (3, 5, "R")], "aLRf"),  # adjacent edits both apply
+    ],
+)
+def test_apply_edits(edits: list[tuple[int, int, str]], expected: str) -> None:
+    assert apply_edits("abcdef", edits) == expected

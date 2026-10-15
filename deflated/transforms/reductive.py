@@ -17,6 +17,7 @@ from .contextual import _IDENT, _RESERVED
 from .ctokens import (
     CINT,
     CNUMBER,
+    apply_edits,
     ctokenize,
     iter_depth,
     match_delimiter,
@@ -24,7 +25,7 @@ from .ctokens import (
     split_args,
     split_top_level,
 )
-from .lexer import SegmentType, scan
+from .lexer import SegmentType, map_code, scan
 
 
 class RemoveWarningComments(Transform):
@@ -303,7 +304,7 @@ class StripCallingConventions(Transform):
         self._rx = re.compile(r" *\b__(?:" + "|".join(self.KEYWORDS) + r")\b *")
 
     def apply(self, code: str) -> str:
-        return "".join((self._rx.sub(" ", t) if seg_type == SegmentType.CODE else t) for seg_type, t in scan(code))
+        return map_code(code, lambda text: self._rx.sub(" ", text))
 
 
 class StripConstQualifier(Transform):
@@ -328,7 +329,7 @@ class StripConstQualifier(Transform):
     _RX = re.compile(r" *\bconst\b *")
 
     def apply(self, code: str) -> str:
-        return "".join((self._RX.sub(" ", t) if seg_type == SegmentType.CODE else t) for seg_type, t in scan(code))
+        return map_code(code, lambda text: self._RX.sub(" ", text))
 
 
 class StripChkSuffix(Transform):
@@ -473,9 +474,7 @@ class StripChkSuffix(Transform):
             # operand position (see the class docstring).
             if i + 2 < n and toks[i + 1][0] == "(" and toks[i + 2][0] == ")":
                 edits.append((start, end, m.group(1)))
-        for lo, hi, rep in reversed(edits):
-            code = code[:lo] + rep + code[hi:]
-        return code
+        return apply_edits(code, edits)
 
 
 class StripTranslationWrappers(Transform):
@@ -553,9 +552,7 @@ class StripTranslationWrappers(Transform):
                             i = close + 1
                             continue
             i += 1
-        for lo, hi, rep in reversed(edits):
-            code = code[:lo] + rep + code[hi:]
-        return code
+        return apply_edits(code, edits)
 
 
 class ElideThunkBodies(Transform):
@@ -625,12 +622,12 @@ class ElideThunkBodies(Transform):
         funcs = _top_level_functions(toks)
         if not funcs:
             return code
-        edits: list[tuple[int, int]] = []
+        edits: list[tuple[int, int, str]] = []
         forwarders: dict[int, str] = {}  # func index -> worker it delegates to
         for k, (name, _ss, bo, bc, _bce) in enumerate(funcs):
             body = [x[0] for x in toks[bo + 1 : bc]]
             if self._is_thunk_body(body, name=name):
-                edits.append((toks[bo][1], toks[bc][2]))
+                edits.append((toks[bo][1], toks[bc][2], ";"))
             else:
                 callee = self._forward_callee(body, name, self._param_names(toks, bo))
                 if callee is not None:
@@ -640,10 +637,8 @@ class ElideThunkBodies(Transform):
         for k, callee in forwarders.items():
             if family[callee] >= self._MIN_FORWARD_FAMILY:
                 _name, _ss, bo, bc, _bce = funcs[k]
-                edits.append((toks[bo][1], toks[bc][2]))
-        for lo, hi in sorted(edits, reverse=True):
-            code = code[:lo] + ";" + code[hi:]
-        return code
+                edits.append((toks[bo][1], toks[bc][2], ";"))
+        return apply_edits(code, edits)
 
     def _is_thunk_body(self, body: list[str], *, name: str) -> bool:
         if not body or any(w in self._CTRL for w in body):
@@ -954,13 +949,11 @@ class EraseResolverStubs(Transform):
             return code
         # Reference guard: how often does each name appear across CODE tokens?
         name_count = Counter(x[0] for x in toks if _IDENT.fullmatch(x[0]))
-        edits: list[tuple[int, int]] = []
+        edits: list[tuple[int, int, str]] = []
         for k, (name, ss, _bo, _bc, bce) in enumerate(funcs):
             if callees.get(k) in resolvers and name_count[name] == 1:
-                edits.append((ss, bce))
-        for lo, hi in sorted(edits, reverse=True):
-            code = code[:lo] + code[hi:]
-        return code
+                edits.append((ss, bce, ""))
+        return apply_edits(code, edits)
 
     def _stub_callee(self, body: list[str]) -> str | None:
         """Return the tail-called callee if ``body`` is a trivial forwarding stub.
@@ -1183,7 +1176,7 @@ class TrimSpuriousArgs(Transform):
     def apply(self, code: str) -> str:
         toks = ctokenize(code)
         n = len(toks)
-        edits: list[tuple[int, int]] = []
+        edits: list[tuple[int, int, str]] = []
         i = 0
         while i < n - 1:
             name = toks[i][0]
@@ -1219,8 +1212,6 @@ class TrimSpuriousArgs(Transform):
                 keep_hi_tok = args[arity - 1][1]  # one past last kept arg
                 lo = toks[keep_hi_tok][1]
                 hi = toks[close][1]
-                edits.append((lo, hi))
+                edits.append((lo, hi, ""))
             i = close + 1
-        for lo, hi in sorted(edits, reverse=True):
-            code = code[:lo] + code[hi:]
-        return code
+        return apply_edits(code, edits)

@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_left
 from enum import StrEnum
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple
 
 # A C char constant closed on the same line: one or more escapes (`\xHH`, `\uHHHH`, octal, `\<char>`) or plain chars.
 # One-or-more, because decompilers emit multi-char constants like `'ABCD'` (int magic values).
@@ -220,6 +220,17 @@ def split_directives(segments: List[Segment]) -> List[Segment]:
 def map_code(code: str, edit: Callable[[str], str]) -> str:
     """Apply `edit` to every `CODE` segment of `code` and leave the rest verbatim."""
     return "".join(edit(text) if seg_type == SegmentType.CODE else text for seg_type, text in scan(code))
+
+
+def iter_code_matches(segments: Iterable[Tuple[str, str]], pattern: re.Pattern) -> Iterator[re.Match]:
+    """
+    Yield every match of `pattern` in the `CODE` segments of `segments`, as `scan` returns them.
+
+    Each match is against its own segment, so its offsets are relative to that segment, not to the whole code.
+    """
+    for seg_type, text in segments:
+        if seg_type == SegmentType.CODE:
+            yield from pattern.finditer(text)
 
 
 def strip_comments(code: str, keep_warnings: bool = False) -> str:

@@ -332,6 +332,13 @@ class TestCompressPlaceholderNames:
         assert "eax" in out and "ebx" in out
         assert "struct S { unsigned int eax; unsigned int ebx; }" in out
 
+    def test_struct_field_after_rename_and_comment_kept(self) -> None:
+        # The struct-body check uses positions in the original code. A rename before a comment shortens the text,
+        # and the struct body that follows the comment must still be found at its original position.
+        c = CompressPlaceholderNames()
+        src = "local_18 = 1; /* c */ struct S { int local_18; };"
+        assert c.apply(src) == "a = 1; /* c */ struct S { int local_18; };"
+
     def test_struct_field_preserved_but_standalone_local_renamed(self) -> None:
         # A name spelled like a placeholder is preserved inside the struct body
         # (real field) yet still compressed where it is a genuine standalone local

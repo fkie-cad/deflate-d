@@ -13,6 +13,7 @@ literal-safe (raw source is read through `lexer.scan`, so string, char, and comm
 nesting depth, `top_level_indices` / `first_top_level` / `split_top_level` find and split on tokens at depth 0
 (`split_args` and `has_top_level_token` are the common cases), and `split_statements` cuts code at top-level `;{}`.
 `word_before` works on raw characters instead and reads back the identifier ending at a given position.
+`apply_edits` writes a batch of `(start, end, replacement)` edits, found on the original offsets, back in one pass.
 
 A stray closer means the structure is unknown from there on. Every helper then answers so that its caller backs off:
 the walk stops, a search finds nothing, a split returns None, and a guard reports a hit.
@@ -76,6 +77,26 @@ def ctokenize(code: str) -> List[CToken]:
             all_c_tokens.append(CToken(m.group(0), current_position + m.start(), current_position + m.end()))
         current_position += len(text)
     return all_c_tokens
+
+
+def apply_edits(code: str, edits: Collection[Tuple[int, int, str]]) -> str:
+    """
+    Return `code` with every `(start, end, replacement)` in `edits` applied, all offsets into the original `code`.
+
+    The edits may come in any order. One that overlaps an edit starting earlier is dropped, so an outer rewrite wins
+    over one nested in it. The result is built in one forward pass: a file can have thousands of edits, and slicing per
+    edit is quadratic.
+    """
+    parts: List[str] = []
+    copied_up_to = 0
+    for start, end, replacement in sorted(edits):
+        if start < copied_up_to:
+            continue
+        parts.append(code[copied_up_to:start])
+        parts.append(replacement)
+        copied_up_to = end
+    parts.append(code[copied_up_to:])
+    return "".join(parts)
 
 
 def split_statements(code: str) -> List[str]:

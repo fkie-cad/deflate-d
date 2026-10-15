@@ -235,3 +235,8 @@ class TestInlineSingleUseTemps:
     def test_stray_closing_brace_after_function_does_not_matter(self) -> None:
         src = "int f(void){int x;x=g();return x;}\n}"
         assert InlineSingleUseTemps().apply(src) == "int f(void){return g();}\n}"
+
+    def test_name_in_macro_body_kept(self) -> None:
+        # A macro body can expand to a use of the temp, so a name in a `#define` counts as one and blocks the fold.
+        src = "#define USE uVar1\nint g(void) {\n  int uVar1;\n  uVar1 = f();\n  return uVar1;\n}\n"
+        assert InlineSingleUseTemps().apply(src) == src
