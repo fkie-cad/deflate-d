@@ -100,7 +100,7 @@ def scan(code: str) -> List[Segment]:
         elif current_character == '"' and (match := _STRING.match(code, current_position)):
             seg_type, end = SegmentType.STRING, match.end()
             segment_start = _literal_start(code, code_start, current_position)
-            if match["close"]:
+            if match.group("close"):
                 string_starts.append(segment_start)
             else:
                 # Unclosed: this line's quotes are unreliable, so freeze from its first string to the newline.
@@ -143,7 +143,7 @@ def string_is_terminated(text: str) -> bool:
     """
     prefix = _LITERAL_PREFIX.match(text)
     match = _STRING.match(text, prefix.end() if prefix else 0)
-    return bool(match and match["close"] and match.end() == len(text))
+    return bool(match and match.group("close") and match.end() == len(text))
 
 
 def ends_with_literal_prefix(text: str) -> bool:

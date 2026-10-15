@@ -13,10 +13,11 @@ import re
 from collections import Counter
 
 from .base import Tier, Transform
-from .contextual import _IDENT, _RESERVED
+from .contextual import _RESERVED
 from .ctokens import (
     CINT,
     CNUMBER,
+    IDENT,
     apply_edits,
     ctokenize,
     iter_depth,
@@ -99,7 +100,6 @@ _OPERAND_START_OPS = frozenset({"(", "*", "&", "-", "~", "!", "+", "++", "--"})
 # Keywords that may precede a cast's `(` (a cast can follow `return`, `case`, ...)
 # without the parentheses being a call/grouping applied to a value.
 _CAST_PREV_KW = frozenset({"return", "case", "sizeof", "if", "while", "for", "switch", "do", "else", "goto"})
-_WCAST_IDENT = re.compile(r"[A-Za-z_]\w*")
 # Bit widths of the pseudo-width types, for the literal-narrowing guard in
 # :class:`StripWidthCasts`: stripping `(_DWORD)` off a literal that does not fit
 # the cast width (or any float literal) would truncate it and change the value.
@@ -235,7 +235,7 @@ class StripWidthCasts(Transform):
         bits = _WIDTH_BITS.get(cast_type)
         if bits is None:
             return True
-        digits = m.group(1)
+        digits = m.group("digits")
         value = int(digits, 16) if digits[:2].lower() == "0x" else int(digits, 10)
         return value < (1 << bits)
 
@@ -243,9 +243,7 @@ class StripWidthCasts(Transform):
     def _operand_starts(tok: str | None) -> bool:
         if tok is None:
             return False
-        return bool(
-            tok in _OPERAND_START_OPS or _WCAST_IDENT.fullmatch(tok) or CNUMBER.fullmatch(tok) or tok[0] in "\"'"
-        )
+        return bool(tok in _OPERAND_START_OPS or IDENT.fullmatch(tok) or CNUMBER.fullmatch(tok) or tok[0] in "\"'")
 
     @staticmethod
     def _prev_is_value(prev: str | None) -> bool:
@@ -258,9 +256,7 @@ class StripWidthCasts(Transform):
         if prev == "sizeof":
             return True
         return bool(
-            prev in {")", "]"}
-            or CNUMBER.fullmatch(prev)
-            or (_WCAST_IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW)
+            prev in {")", "]"} or CNUMBER.fullmatch(prev) or (IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW)
         )
 
 
@@ -538,7 +534,7 @@ class StripTranslationWrappers(Transform):
                 # keyword), or the `)` is immediately followed by a `{` body.
                 is_member = prev in (".", "->")
                 is_declarator = prev == "*" or (
-                    prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW
+                    prev is not None and IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW
                 )
                 is_def = close is not None and close + 1 < n and toks[close + 1][0] == "{"
                 if close is not None and not is_member and not is_declarator and not is_def:
@@ -655,7 +651,7 @@ class ElideThunkBodies(Transform):
                     return False  # more than one call statement
                 call = stmt
             elif stmt[0] == "return":
-                if ret is not None or len(stmt) > 2 or (len(stmt) == 2 and not _IDENT.fullmatch(stmt[1])):
+                if ret is not None or len(stmt) > 2 or (len(stmt) == 2 and not IDENT.fullmatch(stmt[1])):
                     return False
                 ret = stmt
             else:
@@ -682,15 +678,15 @@ class ElideThunkBodies(Transform):
         if "=" in stmt:
             eq = stmt.index("=")
             # exactly `... ident = <single literal>`
-            return eq == len(stmt) - 2 and _IDENT.fullmatch(stmt[eq - 1]) is not None
-        return _IDENT.fullmatch(stmt[-1]) is not None
+            return eq == len(stmt) - 2 and IDENT.fullmatch(stmt[eq - 1]) is not None
+        return IDENT.fullmatch(stmt[-1]) is not None
 
     def _is_forward_call(self, call: list[str], name: str) -> bool:
         c = call[:]
         if c and c[0] == "return":
             c = c[1:]
         # strip a leading `tmp =` (the returning-temp Ghidra shape)
-        if len(c) >= 2 and _IDENT.fullmatch(c[0]) and c[1] == "=":
+        if len(c) >= 2 and IDENT.fullmatch(c[0]) and c[1] == "=":
             c = c[2:]
         c = self._strip_leading_casts(c)
         if len(c) < 3:
@@ -744,7 +740,7 @@ class ElideThunkBodies(Transform):
         if len(s) < 5 or s[0] != "return" or s[2] != "(":
             return None
         callee = s[1]
-        if not _IDENT.fullmatch(callee) or callee == name or callee in _RESERVED or callee.startswith("PTR_"):
+        if not IDENT.fullmatch(callee) or callee == name or callee in _RESERVED or callee.startswith("PTR_"):
             return None
         c = s[1:]  # `WORKER ( ...args... )`
         close = match_delimiter(c, 1)
@@ -757,7 +753,7 @@ class ElideThunkBodies(Transform):
         arg_lists = self._split_top_commas(c[2:close])
         if arg_lists is None:
             return None
-        arg_idents = [a[0] if len(a) == 1 and _IDENT.fullmatch(a[0]) else None for a in arg_lists]
+        arg_idents = [a[0] if len(a) == 1 and IDENT.fullmatch(a[0]) else None for a in arg_lists]
         if not params or arg_idents != params:
             return None
         return callee
@@ -785,7 +781,7 @@ class ElideThunkBodies(Transform):
             return None
         names: list[str] = []
         for param in params:
-            ids = [t for t in param if _IDENT.fullmatch(t)]
+            ids = [t for t in param if IDENT.fullmatch(t)]
             if ids:
                 names.append(ids[-1])
         return [] if names == ["void"] else names
@@ -808,7 +804,7 @@ class ElideThunkBodies(Transform):
             # A dereferenced callee `(*PTR_x)` also contains only idents and `*`
             # but *starts* with `*`, so the leading-`*` test keeps it as the
             # callee group rather than stripping it as a cast.
-            if not inner or inner[0] == "*" or any(not (_IDENT.fullmatch(tok) or tok == "*") for tok in inner):
+            if not inner or inner[0] == "*" or any(not (IDENT.fullmatch(tok) or tok == "*") for tok in inner):
                 break
             c = c[close + 1 :]
         return c
@@ -841,7 +837,7 @@ def _body_open_after(toks: list, close: int, n: int) -> int | None:
         tj = toks[j][0]
         if tj == "{":
             return j
-        if tj in _DECL_SUFFIX or _IDENT.fullmatch(tj):
+        if tj in _DECL_SUFFIX or IDENT.fullmatch(tj):
             j += 1
             continue
         return None
@@ -880,7 +876,7 @@ def _top_level_functions(toks: list) -> list[tuple[str, int, int, int, int]]:
         # A `(` immediately followed by `*` is a declarator grouping wrapping the
         # real name (`(**init_proc())`), not this token's parameter list.
         if (
-            _IDENT.fullmatch(t)
+            IDENT.fullmatch(t)
             and t not in _RESERVED
             and i + 1 < n
             and toks[i + 1][0] == "("
@@ -948,7 +944,7 @@ class EraseResolverStubs(Transform):
         if not resolvers:
             return code
         # Reference guard: how often does each name appear across CODE tokens?
-        name_count = Counter(x[0] for x in toks if _IDENT.fullmatch(x[0]))
+        name_count = Counter(x[0] for x in toks if IDENT.fullmatch(x[0]))
         edits: list[tuple[int, int, str]] = []
         for k, (name, ss, _bo, _bc, bce) in enumerate(funcs):
             if callees.get(k) in resolvers and name_count[name] == 1:
@@ -975,7 +971,7 @@ class EraseResolverStubs(Transform):
                 if (
                     call is not None
                     or len(stmt) < 4
-                    or not _IDENT.fullmatch(stmt[1])
+                    or not IDENT.fullmatch(stmt[1])
                     or stmt[2] != "("
                     or stmt[-1] != ")"
                 ):
@@ -999,8 +995,8 @@ class EraseResolverStubs(Transform):
             return False
         if "=" in stmt:
             eq = stmt.index("=")
-            return eq == len(stmt) - 2 and _IDENT.fullmatch(stmt[eq - 1]) is not None
-        return _IDENT.fullmatch(stmt[-1]) is not None
+            return eq == len(stmt) - 2 and IDENT.fullmatch(stmt[eq - 1]) is not None
+        return IDENT.fullmatch(stmt[-1]) is not None
 
 
 class DropCrtFunctions(Transform):
@@ -1075,7 +1071,7 @@ class DropCrtFunctions(Transform):
         cand_names = {c[0] for c in candidates}
         occ: dict[str, list[int]] = {nm: [] for nm in cand_names}
         for text, start, _end in toks:
-            if text in cand_names and _IDENT.fullmatch(text):
+            if text in cand_names and IDENT.fullmatch(text):
                 occ[text].append(start)
 
         deletion = list(candidates)
@@ -1194,7 +1190,7 @@ class TrimSpuriousArgs(Transform):
             # leaves an over-arged prototype (`void *memcpy(a, b, c, extra);`)
             # untouched, exactly like a definition.
             prev = toks[i - 1][0] if i > 0 else None
-            if prev == "*" or (prev is not None and _IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW):
+            if prev == "*" or (prev is not None and IDENT.fullmatch(prev) and prev not in self._CALL_PREV_KW):
                 i += 1
                 continue
             close = match_delimiter(toks, i + 1)

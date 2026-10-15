@@ -20,6 +20,7 @@ from .ctokens import (
     CINT,
     CLOSER_FOR,
     CNUMBER,
+    IDENT,
     OPENER_FOR,
     CToken,
     apply_edits,
@@ -57,10 +58,7 @@ _TYPE_WORDS = frozenset(
 # One leading goto label such as `LABEL_3:` (not C++ `::`); group 1 is its name.
 _LABEL_PREFIX = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*")
 
-# An identifier, and the keywords that may stand before a unary `*` and are never an operand value. (Numbers are
-# matched with `CINT`.)
-_IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
-_IDENT = re.compile(r"[A-Za-z_]\w*")
+# The keywords that may stand before a unary `*` and are never an operand value.
 _NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
@@ -71,7 +69,7 @@ def _is_cast(group_texts: List[str]) -> bool:
     neither counts.
     """
     name_count = 0
-    while name_count < len(group_texts) and _IDENT_RX.match(group_texts[name_count]):
+    while name_count < len(group_texts) and IDENT.fullmatch(group_texts[name_count]):
         name_count += 1
     stars = group_texts[name_count:]
     if name_count == 0 or any(text != "*" for text in stars):
@@ -278,7 +276,7 @@ class DropSingleStatementBraces(Transform):
         # Skip leading goto labels (`L: if (b) ...;`), or a labeled inner `if` would pass the dangling-else check.
         first = 0
         while (
-            _IDENT_RX.match(texts[first])
+            IDENT.fullmatch(texts[first])
             and texts[first] not in ("case", "default")
             and texts[first + 1] == ":"
             and texts[first + 2] != ":"  # not C++ `::`
@@ -298,11 +296,11 @@ class DropSingleStatementBraces(Transform):
 
         Without types, `a * b;` also reads as a declaration; that only keeps braces that could have gone.
         """
-        if not _IDENT_RX.match(texts[0]):
+        if not IDENT.fullmatch(texts[0]):
             return False
         index = 1
         while index is not None:
-            if texts[index : index + 2] == [":", ":"] and _IDENT_RX.match(texts[index + 2]):
+            if texts[index : index + 2] == [":", ":"] and IDENT.fullmatch(texts[index + 2]):
                 index += 3
             elif texts[index] == "<" or (index == 1 and texts[index] == "(" and texts[index + 1] != "*"):
                 index = cls._skip_group(texts, index)
@@ -313,12 +311,12 @@ class DropSingleStatementBraces(Transform):
         while texts[index] in ("*", "&"):
             index += 1
         if texts[index : index + 2] != ["(", "*"]:
-            return bool(_IDENT_RX.match(texts[index]))
+            return bool(IDENT.fullmatch(texts[index]))
         # `(*name)(` or `(*name)[`; `f(*p);` is a call.
         index += 2
         while texts[index] == "*":
             index += 1
-        return bool(_IDENT_RX.match(texts[index])) and texts[index + 1 : index + 3] in ([")", "("], [")", "["])
+        return bool(IDENT.fullmatch(texts[index])) and texts[index + 1 : index + 3] in ([")", "("], [")", "["])
 
     @staticmethod
     def _skip_group(texts: List[str], index: int) -> Optional[int]:
@@ -481,7 +479,7 @@ class CompoundAssignment(Transform):
                     break
                 index = colon_index + 1
             elif (
-                _IDENT_RX.match(tokens[index].text)  # a goto label or `default`
+                IDENT.fullmatch(tokens[index].text)  # a goto label or `default`
                 and tokens[index + 1].text == ":"
                 and not (index + 2 < len(tokens) and tokens[index + 2].text == ":")  # not `::`
             ):
@@ -610,8 +608,8 @@ class InlineSingleUseTemps(Transform):
     description = "Inline a single-use spill temporary into its return."
 
     # `=(?!=)`, so `x == y;` is not read as an assignment.
-    _ASSIGN = re.compile(r"^(\s*)([A-Za-z_]\w*)\s*=(?!=)\s*(.+);\s*$", re.S)
-    _RETURN = re.compile(r"^\s*return\s+([A-Za-z_]\w*)\s*;(\s*)$", re.S)
+    _ASSIGN = re.compile(r"^(?P<indent>\s*)(?P<name>[A-Za-z_]\w*)\s*=(?!=)\s*(?P<expr>.+);\s*$", re.S)
+    _RETURN = re.compile(r"^\s*return\s+(?P<name>[A-Za-z_]\w*)\s*;(?P<trail>\s*)$", re.S)
     _DECL = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_ ]*\s+\**(?P<name>[A-Za-z_]\w*)\s*;\s*$")
     # A function header `<return type> <name>(`; the return type is group 1.
     _HEADER = re.compile(r"^\s*(.*?)\b[A-Za-z_]\w*\s*\(", re.S)
@@ -628,16 +626,16 @@ class InlineSingleUseTemps(Transform):
         piece_starts = list(accumulate((len(piece) for piece in pieces), initial=0))[:-1]
         scopes = self._scopes(code, piece_starts)
         decl_indices_by_name = self._declarations(pieces)
-        keep = [True] * len(pieces)
+        removed_pieces: Set[int] = set()  # indices of the declarations and returns a fold makes redundant
 
         index = 0
         while index < len(pieces) - 1:
             assign_match = self._ASSIGN.match(pieces[index])
             return_match = self._RETURN.match(pieces[index + 1])
-            if not (assign_match and return_match and assign_match.group(2) == return_match.group(1)):
+            if not (assign_match and return_match and assign_match.group("name") == return_match.group("name")):
                 index += 1
                 continue
-            name, expr = assign_match.group(2), assign_match.group(3)
+            name, expr = assign_match.group("name"), assign_match.group("expr")
             # A declaration in another scope (a global) does not count, so its name occurs once too often.
             decl_indices = [
                 decl_index for decl_index in decl_indices_by_name.get(name, []) if scopes[decl_index] == scopes[index]
@@ -647,18 +645,18 @@ class InlineSingleUseTemps(Transform):
                 continue
             value = expr.strip()
             if decl_indices:
-                keep[decl_indices[0]] = False
+                removed_pieces.add(decl_indices[0])
                 temp_type = self._temp_type(pieces[decl_indices[0]])
                 value = self._converted(value, temp_type, self._return_type(code, piece_starts[index]))
-            pieces[index] = f"{assign_match.group(1)}return {value};{return_match.group(2)}"
-            keep[index + 1] = False
+            pieces[index] = f"{assign_match.group('indent')}return {value};{return_match.group('trail')}"
+            removed_pieces.add(index + 1)
             index += 2
-        return "".join(piece for index, piece in enumerate(pieces) if keep[index])
+        return "".join(piece for index, piece in enumerate(pieces) if index not in removed_pieces)
 
     @staticmethod
     def _name_counts(code: str) -> Counter:
         """Count each identifier in the code segments of `code`, so names in strings and comments are not counted."""
-        return Counter(m.group(0) for m in iter_code_matches(scan(code), _IDENT))
+        return Counter(m.group(0) for m in iter_code_matches(scan(code), IDENT))
 
     @classmethod
     def _declarations(cls, pieces: List[str]) -> DefaultDict[str, List[int]]:
@@ -779,7 +777,7 @@ class InlineSingleUseTemps(Transform):
             return expr
         if (
             len(tokens) >= 3
-            and _IDENT_RX.match(tokens[0].text)
+            and IDENT.fullmatch(tokens[0].text)
             and tokens[1].text == "("
             and match_delimiter(tokens, 1) == len(tokens) - 1
         ):
@@ -872,7 +870,7 @@ class TernaryFromIfElse(Transform):
             # The if runs the condition before the lvalue; `LV = C ? A : B` does not fix their order. An update in
             # the lvalue can only reach the condition through a shared name or memory read via `*`, `->`, `[`.
             shared = self._identifiers(tokens, cond_start, cond_end) & self._identifiers(tokens, lv_start, lv_end)
-            lv_is_name = lv_end - lv_start == 1 and _IDENT_RX.match(tokens[lv_start].text)
+            lv_is_name = lv_end - lv_start == 1 and IDENT.fullmatch(tokens[lv_start].text)
             cond_reads_memory = any(token.text in self._INDIRECT for token in tokens[cond_start:cond_end])
             if (
                 (self._has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
@@ -948,7 +946,7 @@ class TernaryFromIfElse(Transform):
             if tokens[index].text != "(":
                 continue
             before = tokens[index - 1].text
-            if before == "]" or (_IDENT_RX.match(before) and before not in _NONVALUE_KW):
+            if before == "]" or (IDENT.fullmatch(before) and before not in _NONVALUE_KW):
                 return True
             if before == ")":
                 opener = match_delimiter_backward(tokens, index - 1, start)
@@ -965,7 +963,7 @@ class TernaryFromIfElse(Transform):
     def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
         """The identifiers in `tokens[start:end]`, keywords excluded."""
         return {
-            token.text for token in tokens[start:end] if _IDENT_RX.match(token.text) and token.text not in _NONVALUE_KW
+            token.text for token in tokens[start:end] if IDENT.fullmatch(token.text) and token.text not in _NONVALUE_KW
         }
 
 
@@ -1053,7 +1051,6 @@ class MinimizeIntegerLiterals(Transform):
     tier = Tier.T2_STRUCTURAL
     description = "Re-spell a hex literal in decimal when shorter."
 
-    _HEX = re.compile(r"(0[xX][0-9a-fA-F]+)([uUlL]*|[uU]?i(?:8|16|32|64))")
     _INT_MAX = 0x7FFFFFFF
 
     def apply(self, code: str) -> str:
@@ -1063,10 +1060,10 @@ class MinimizeIntegerLiterals(Transform):
         edits: List[Tuple[int, int, str]] = []
         for token in ctokenize(code):
             # A hex-float literal (`0x1f.0p3`) is one token and never matches.
-            hex_match = self._HEX.fullmatch(token.text)
-            if hex_match is None:
+            int_match = CINT.fullmatch(token.text)
+            if int_match is None or int_match.group("digits")[:2] not in ("0x", "0X"):
                 continue
-            hex_digits, suffix = hex_match.groups()
+            hex_digits, suffix = int_match.group("digits", "suffix")
             value = int(hex_digits, 16)
             if value > self._INT_MAX:
                 continue  # wider than int: decimal would change the literal's type
@@ -1118,7 +1115,7 @@ class DerefOffsetToIndex(Transform):
                 is_value = previous is not None and (
                     previous in self._VALUE_BEFORE
                     or CNUMBER.fullmatch(previous)
-                    or (_IDENT_RX.match(previous) and previous not in _NONVALUE_KW)
+                    or (IDENT.fullmatch(previous) and previous not in _NONVALUE_KW)
                 )
                 if not is_value:
                     close = match_delimiter(tokens, index + 1)
@@ -1139,7 +1136,7 @@ class DerefOffsetToIndex(Transform):
         """
         if (
             len(inner) == 3
-            and _IDENT_RX.match(inner[0])
+            and IDENT.fullmatch(inner[0])
             and inner[0] not in _NONVALUE_KW
             and inner[1] == "+"
             and CINT.fullmatch(inner[2])
@@ -1148,7 +1145,7 @@ class DerefOffsetToIndex(Transform):
         if (
             len(inner) == 4
             and inner[0] == "&"
-            and _IDENT_RX.match(inner[1])
+            and IDENT.fullmatch(inner[1])
             and inner[1] not in _NONVALUE_KW
             and inner[2] == "+"
             and CINT.fullmatch(inner[3])

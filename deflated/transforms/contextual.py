@@ -15,7 +15,7 @@ import string
 from typing import Callable
 
 from .base import Tier, Transform
-from .ctokens import CINT, CNUMBER, apply_edits, ctokenize, match_delimiter
+from .ctokens import CINT, CNUMBER, IDENT, apply_edits, ctokenize, match_delimiter
 from .lexer import SegmentType, iter_code_matches, map_code, scan
 
 # Keywords/types we must never hand out as a generated short name.
@@ -65,7 +65,6 @@ _RESERVED = {
     "volatile",
 }
 
-_IDENT = re.compile(r"[A-Za-z_]\w*")
 # A crude token: an identifier or any single non-space character.
 _IDENT_OR_CHAR = re.compile(r"[A-Za-z_]\w*|\S")
 
@@ -123,7 +122,7 @@ def _struct_body_spans(code: str) -> list[tuple[int, int]]:
     while i < n:
         if toks[i][0] in ("struct", "union"):
             j = i + 1
-            while j < n and _IDENT.fullmatch(toks[j][0]):  # optional tag name
+            while j < n and IDENT.fullmatch(toks[j][0]):  # optional tag name
                 j += 1
             if j < n and toks[j][0] == "{":
                 close = match_delimiter(toks, j)
@@ -251,14 +250,14 @@ class CompressFunctionNames(Transform):
         if not targets:
             return code
 
-        existing = {m.group(0) for m in iter_code_matches(segments, _IDENT)}
+        existing = {m.group(0) for m in iter_code_matches(segments, IDENT)}
         gen = _short_names(used=set(existing))
         mapping = {name: next(gen) for name in targets}
         return _rename(segments, mapping)
 
     def _all_placeholder_funcs(self, segments: list[tuple[str, str]]) -> list[str]:
         """Every placeholder function name anywhere (def, prototype, or call)."""
-        names = (m.group(0) for m in iter_code_matches(segments, _IDENT))
+        names = (m.group(0) for m in iter_code_matches(segments, IDENT))
         return [name for name in dict.fromkeys(names) if self._is_func.match(name)]
 
     def _defined_functions(self, segments: list[tuple[str, str]]) -> list[str]:
@@ -416,7 +415,7 @@ class CompressPlaceholderNames(Transform):
         offset = 0
         for seg_type, text in segments:
             if seg_type == SegmentType.CODE:
-                for match in _IDENT.finditer(text):
+                for match in IDENT.finditer(text):
                     name = match.group(0)
                     existing.add(name)
                     # A field is neither renamed nor counted as a placeholder occurrence, so the unit stays
@@ -650,7 +649,7 @@ class DropNullPointerCast(Transform):
                 continue
             inner = toks[i + 1 : close]
             # Pointer-type cast: identifiers/keywords and `*` only, ending in `*`.
-            if inner[-1][0] != "*" or any(not (_IDENT.fullmatch(t[0]) or t[0] == "*") for t in inner):
+            if inner[-1][0] != "*" or any(not (IDENT.fullmatch(t[0]) or t[0] == "*") for t in inner):
                 i += 1
                 continue
             null_idx = close + 1
@@ -683,7 +682,7 @@ class DropNullPointerCast(Transform):
                 outer_before = toks[i - 2][0] if i >= 2 else None
                 is_call = outer_before is not None and (
                     outer_before in {")", "]"}
-                    or (_IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
+                    or (IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
                 )
                 if not is_call:
                     outer_after = toks[null_idx + 2][0] if null_idx + 2 < n else None
@@ -741,7 +740,7 @@ class AddressOfIndexToOffset(Transform):
         edits: list[tuple[int, int, str]] = []
         i = 0
         while i + 4 < n:
-            if toks[i][0] == "&" and _IDENT.fullmatch(toks[i + 1][0]) and toks[i + 2][0] == "[":
+            if toks[i][0] == "&" and IDENT.fullmatch(toks[i + 1][0]) and toks[i + 2][0] == "[":
                 close = match_delimiter(toks, i + 2)
                 prev = toks[i - 1][0] if i > 0 else None
                 # `&` is binary (bitwise-and) only after a value: a non-keyword
@@ -750,7 +749,7 @@ class AddressOfIndexToOffset(Transform):
                 is_value = prev is not None and (
                     prev in self._VALUE_BEFORE
                     or CNUMBER.fullmatch(prev)
-                    or (_IDENT.fullmatch(prev) and prev not in _RESERVED)
+                    or (IDENT.fullmatch(prev) and prev not in _RESERVED)
                 )
                 unary = not is_value
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
@@ -791,7 +790,7 @@ class StripPointerSlotAddress(Transform):
 
     def apply(self, code: str) -> str:
         segments = scan(code)
-        names = {m.group(0) for m in iter_code_matches(segments, _IDENT)}
+        names = {m.group(0) for m in iter_code_matches(segments, IDENT)}
         # Group candidates by their stripped form to detect collisions.
         by_stripped: dict[str, list[str]] = {}
         for name in names:

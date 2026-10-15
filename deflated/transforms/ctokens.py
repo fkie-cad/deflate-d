@@ -45,8 +45,11 @@ CNUMBER = re.compile(
     r"|(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\w*"
 )
 
-# An integer literal with an optional integer suffix; group 1 is the digits (with any `0x` prefix), group 2 the suffix.
-CINT = re.compile(r"(0[xX][0-9a-fA-F]+|\d+)([uUlL]*|[uU]?i(?:8|16|32|64))")
+# An integer literal with an optional integer suffix; `digits` keeps any `0x` prefix.
+CINT = re.compile(r"(?P<digits>0[xX][0-9a-fA-F]+|\d+)(?P<suffix>[uUlL]*|[uU]?i(?:8|16|32|64))")
+
+# An identifier or keyword: `fullmatch` tests a token, `finditer` finds the names in code.
+IDENT = re.compile(r"[A-Za-z_]\w*")
 
 # A single C token: multi-char operators first (so they are not split), then identifiers, numeric literals, and finally
 # any single non-space character.
