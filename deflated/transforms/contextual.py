@@ -15,7 +15,7 @@ import string
 from typing import Callable
 
 from .base import Tier, Transform
-from .ctokens import CINT, CNUMBER, IDENT, NONVALUE_KW, apply_edits, ctokenize, match_delimiter
+from .ctokens import CINT, IDENT, TYPE_OPERATORS, apply_edits, ctokenize, is_value_before, match_delimiter
 from .lexer import SegmentType, iter_code_matches, map_code, scan
 
 # Keywords/types we must never hand out as a generated short name.
@@ -597,14 +597,6 @@ class DropNullPointerCast(Transform):
     _SAFE_BEFORE = frozenset(
         {"=", "==", "!=", "<", ">", "<=", ">=", "(", "[", "{", ",", ";", "return", "?", ":", "&&", "||", "!", "}"}
     )
-    # Operators that take a *type* operand: a cast directly inside their `(` is
-    # load-bearing (it fixes the operand type), so the pointer cast on the null is
-    # NOT redundant there and must be kept (`sizeof((char *)0x0)` is `sizeof(char*)`,
-    # not `sizeof(0)`). The `(` of one of these reads as a `_SAFE_BEFORE` token, so
-    # it is excluded explicitly.
-    _TYPE_OP_BEFORE_PAREN = frozenset(
-        {"sizeof", "_Alignof", "alignof", "__alignof__", "typeof", "__typeof__", "decltype"}
-    )
     # Tokens that may follow the null literal without the int/pointer distinction mattering.
     _SAFE_AFTER = frozenset({")", ";", ",", "]", "}", ":", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "?"})
     # The null constant in either spelling. ``int-minform`` (T2) re-spells ``0x0``
@@ -647,7 +639,7 @@ class DropNullPointerCast(Transform):
                 continue
             # `sizeof((T *)0x0)` / `_Alignof((T *)0x0)`: the cast fixes the operand
             # type, so it is load-bearing -- declining keeps the pointer width.
-            if before == "(" and i >= 2 and toks[i - 2][0] in self._TYPE_OP_BEFORE_PAREN:
+            if before == "(" and i >= 2 and toks[i - 2][0] in TYPE_OPERATORS:
                 i += 1
                 continue
             # When the cast+null is itself wrapped in parens `((T *)0x0)`, the inner
@@ -660,9 +652,7 @@ class DropNullPointerCast(Transform):
             # pass's stated decline-when-ambiguous contract.)
             if before == "(" and after == ")" and match_delimiter(toks, i - 1) == null_idx + 1:
                 outer_before = toks[i - 2][0] if i >= 2 else None
-                is_call = outer_before is not None and (
-                    outer_before in {")", "]"} or (IDENT.fullmatch(outer_before) and outer_before not in NONVALUE_KW)
-                )
+                is_call = is_value_before(outer_before)
                 if not is_call:
                     outer_after = toks[null_idx + 2][0] if null_idx + 2 < n else None
                     if outer_after is not None and outer_after not in self._SAFE_AFTER:
@@ -704,9 +694,6 @@ class AddressOfIndexToOffset(Transform):
     tier = Tier.T3_CONTEXTUAL
     description = "Rewrite the address-of-a-literal-index idiom to a pointer add."
 
-    # Tokens after which a bare ``&`` is binary (bitwise-and), so a following
-    # ``&id[n]`` is NOT an address-of and must not be rewritten.
-    _VALUE_BEFORE = frozenset({")", "]"})
     # Postfix operators bind tighter than the prefix ``&``; if one follows the
     # ``]`` the subscript binds to the postfix, not to the ``&``, so rewriting
     # ``&base[n]`` in isolation would re-associate (and drop the ``&``). Mirrors
@@ -722,19 +709,13 @@ class AddressOfIndexToOffset(Transform):
             if toks[i][0] == "&" and IDENT.fullmatch(toks[i + 1][0]) and toks[i + 2][0] == "[":
                 close = match_delimiter(toks, i + 2)
                 prev = toks[i - 1][0] if i > 0 else None
-                # `&` is binary (bitwise-and) only after a value: a non-keyword
-                # identifier, a number, or a closing `)`/`]`. After a keyword
+                # `&` is binary (bitwise-and) only after a value. After a keyword
                 # (`return`), an operator, or `(`/`,`/`;` it is unary address-of.
-                is_value = prev is not None and (
-                    prev in self._VALUE_BEFORE
-                    or CNUMBER.fullmatch(prev)
-                    or (IDENT.fullmatch(prev) and prev not in NONVALUE_KW)
-                )
-                unary = not is_value
+                unary = not is_value_before(prev)
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
                 # ``CINT``, not ``CNUMBER``: a match here *performs* the rewrite,
                 # and only an integer is a valid subscript to fold into a pointer
-                # add. (Above, a match only declines, so the wider form is safe.)
+                # add.
                 if close == i + 4 and unary and CINT.fullmatch(toks[i + 3][0]) and after not in self._BLOCK_AFTER:
                     rep = f"({toks[i + 1][0]}+{toks[i + 3][0]})"
                     edits.append((toks[i][1], toks[close][2], rep))

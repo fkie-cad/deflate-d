@@ -18,9 +18,10 @@ from .ctokens import (
     CINT,
     CNUMBER,
     IDENT,
-    NONVALUE_KW,
+    TYPE_OPERATORS,
     apply_edits,
     ctokenize,
+    is_value_before,
     iter_depth,
     match_delimiter,
     match_delimiter_backward,
@@ -249,13 +250,7 @@ class StripWidthCasts(Transform):
         # to that value (``f(_QWORD)``, ``a[i](_QWORD)``), never a cast. Keywords
         # such as ``return``/``sizeof`` are not values, but ``sizeof(_QWORD)`` is
         # a size-of, so it is excluded here too.
-        if prev is None:
-            return False
-        if prev == "sizeof":
-            return True
-        return bool(
-            prev in {")", "]"} or CNUMBER.fullmatch(prev) or (IDENT.fullmatch(prev) and prev not in NONVALUE_KW)
-        )
+        return prev in TYPE_OPERATORS or is_value_before(prev)
 
 
 class StripCallingConventions(Transform):

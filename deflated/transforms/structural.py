@@ -19,7 +19,6 @@ from .base import Tier, Transform
 from .ctokens import (
     CINT,
     CLOSER_FOR,
-    CNUMBER,
     CTRL_KW,
     IDENT,
     NONVALUE_KW,
@@ -30,6 +29,7 @@ from .ctokens import (
     ctokenize,
     first_top_level,
     has_top_level_token,
+    is_value_before,
     iter_depth,
     match_delimiter,
     match_delimiter_backward,
@@ -940,7 +940,7 @@ class TernaryFromIfElse(Transform):
             if tokens[index].text != "(":
                 continue
             before = tokens[index - 1].text
-            if before == "]" or (IDENT.fullmatch(before) and before not in NONVALUE_KW):
+            if before != ")" and is_value_before(before):
                 return True
             if before == ")":
                 opener = match_delimiter_backward(tokens, index - 1, start)
@@ -1088,9 +1088,6 @@ class DerefOffsetToIndex(Transform):
     tier = Tier.T2_STRUCTURAL
     description = "Rewrite a dereferenced pointer-add as a subscript."
 
-    # Tokens after which `*` is a multiply. A postfix `++`/`--` ends an operand (`x++ * (p + 4)`). This also skips the
-    # prefix case `++*(p + 4)`, which looks the same; skipping only misses a rewrite.
-    _VALUE_BEFORE = frozenset({")", "]", "++", "--"})
     # Postfix operators bind tighter than prefix `*`, so a rewrite before one would regroup the expression.
     _BLOCK_AFTER = frozenset({".", "->", "(", "[", "++", "--"})
 
@@ -1105,13 +1102,8 @@ class DerefOffsetToIndex(Transform):
         while index < token_count:
             if tokens[index].text == "*" and index + 1 < token_count and tokens[index + 1].text == "(":
                 previous = tokens[index - 1].text if index > 0 else None
-                # `CNUMBER`, not `CINT`: a float (`1.5 * (a + 4)`) is a value too, and a match only skips the rewrite.
-                is_value = previous is not None and (
-                    previous in self._VALUE_BEFORE
-                    or CNUMBER.fullmatch(previous)
-                    or (IDENT.fullmatch(previous) and previous not in NONVALUE_KW)
-                )
-                if not is_value:
+                # A `*` after a value (`a * (b + c)`, `1.5 * (a + 4)`, `i++ * (p + 4)`) is a multiply.
+                if not is_value_before(previous):
                     close = match_delimiter(tokens, index + 1)
                     if close is not None:
                         replacement = self._index_form([token.text for token in tokens[index + 2 : close]])

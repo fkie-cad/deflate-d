@@ -14,6 +14,7 @@ nesting depth, `top_level_indices` / `first_top_level` / `split_top_level` find 
 (`split_args` and `has_top_level_token` are the common cases), and `split_statements` cuts code at top-level `;{}`.
 `word_before` works on raw characters instead and reads back the identifier ending at a given position.
 `apply_edits` writes a batch of `(start, end, replacement)` edits, found on the original offsets, back in one pass.
+`is_value_before` tells whether a token ends an operand, from the shared keyword sets (`NONVALUE_KW`, `TYPE_OPERATORS`).
 
 A stray closer means the structure is unknown from there on. Every helper then answers so that its caller backs off:
 the walk stops, a search finds nothing, a split returns None, and a guard reports a hit.
@@ -64,6 +65,29 @@ STMT_KW = frozenset(
 # Keywords that are never an operand value, so a `*`, `&` or `(` after one is unary or a group, not an operator or a
 # call.
 NONVALUE_KW = CTRL_KW | STMT_KW
+
+# Operators that take a type in their `(...)`: a cast written there is the operand type, never redundant.
+TYPE_OPERATORS = frozenset({"sizeof", "typeof", "__typeof__", "alignof", "_Alignof", "__alignof__", "decltype"})
+
+# Punctuation that ends an operand. A postfix `++`/`--` counts (`i++ * x` is a multiply); the prefix form looks the same,
+# so `++*(p + 4)` is read that way too, which only makes a rewrite back off.
+VALUE_END = frozenset({")", "]", "++", "--"})
+
+
+def is_value_before(text: str | None) -> bool:
+    """
+    True if the token `text` ends an operand value: an identifier that is not in `NONVALUE_KW`, a number, or a
+    `VALUE_END`. A `*` or `&` after a value is binary, and a `(` after one is a call or a group applied to it. None (no
+    token before) is not a value.
+
+    `typeof`, `alignof` and `decltype` are not keywords here, so they count as values and a rewrite after them backs
+    off. `sizeof` is a keyword: `sizeof *p` dereferences. A caller that must keep `sizeof(T)` intact checks
+    `TYPE_OPERATORS` itself.
+    """
+    if text is None:
+        return False
+    return text in VALUE_END or bool(CNUMBER.fullmatch(text)) or bool(IDENT.fullmatch(text)) and text not in NONVALUE_KW
+
 
 # A single C token: multi-char operators first (so they are not split), then identifiers, numeric literals, and finally
 # any single non-space character.
