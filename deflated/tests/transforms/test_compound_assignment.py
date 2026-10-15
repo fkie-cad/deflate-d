@@ -150,3 +150,109 @@ class TestCompoundAssignment:
         t = CompoundAssignment()
         assert t.apply('p = "a = a + 1;";') == 'p = "a = a + 1;";'
         assert t.apply("i = i + 1; /* a = a + 1; */") == "i += 1; /* a = a + 1; */"
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            # An assignment in the target is a side effect like `++`: the fold would run it once instead of twice.
+            "a[i += 1] = a[i += 1] * 2;",
+            "a[i = i + 1] = a[i = i + 1] + 1;",
+            "*(p = q) = *(p = q) + 1;",
+        ],
+    )
+    def test_assignment_in_target_not_folded(self, src) -> None:
+        assert CompoundAssignment().apply(src) == src
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "int a = a + 1;",  # a declaration: `int a += 1;` is invalid C
+            "-x;",  # no top-level `=`
+            "= a + 1;",  # nothing left of `=`
+            "a = a + ;",  # nothing after OP
+            "a = a + 1",  # no `;`
+            "a = a = a + 1;",  # chained assignment: `=` is not a compound OP
+            "a = a + b ? c : d;",  # `?:` binds looser than `+`
+            "#define INC(a) a = a + 1;",  # a directive line
+        ],
+    )
+    def test_malformed_or_unsafe_shapes_not_folded(self, src) -> None:
+        assert CompoundAssignment().apply(src) == src
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            ("a = a ^ b ^ c;", "a ^= b ^ c;"),  # `^` is associative like `&` and `|`
+            ("(a) = (a) + 1;", "(a) += 1;"),
+            ("(*p).x = (*p).x + 1;", "(*p).x += 1;"),
+            ("a = a +\n  (b << 4);", "a += (b << 4);"),  # a statement over several lines
+            ("a = a + /* c */ 1;", "a += /* c */ 1;"),  # a comment in the remainder is kept
+            ("a=a+1;b=b-2;", "a += 1;b -= 2;"),  # several statements
+            ("\n    a = a + 1;  \n", "\n    a += 1;  \n"),  # indent and trailing whitespace are kept
+            ("{ a = a + 1; }", "{ a += 1; }"),
+        ],
+    )
+    def test_more_shapes_folded(self, src, expected) -> None:
+        assert CompoundAssignment().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            # Leading `case`, `default` and goto labels are kept in front; a `case` label may hold `?:` or `::`.
+            ("case 1: a = a + 1;", "case 1: a += 1;"),
+            ("default: a = a + 1;", "default: a += 1;"),
+            ("case A ? 1 : 2: a = a + 1;", "case A ? 1 : 2: a += 1;"),
+            ("case Foo::Bar: a = a + 1;", "case Foo::Bar: a += 1;"),
+            ("L: case 2: a = a - 1;", "L: case 2: a -= 1;"),
+        ],
+    )
+    def test_case_labels_folded(self, src, expected) -> None:
+        assert CompoundAssignment().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            ("for (i = 0; i < n; i = i + 1) f();", "for (i = 0; i < n; i += 1) f();"),
+            ("for(i=0;i<n;i=i*2){x = x + 1;}", "for(i=0;i<n;i *= 2){x += 1;}"),
+            ("for (i = 0; f(a, b); i = i + 1) g();", "for (i = 0; f(a, b); i += 1) g();"),  # `,` inside a call
+            ("for (;;) f();", "for (;;) f();"),
+            ("for (i = 0; i < n; i = i + 1, j = j + 1) f();", "for (i = 0; i < n; i = i + 1, j = j + 1) f();"),
+        ],
+    )
+    def test_for_increment_folded(self, src, expected) -> None:
+        assert CompoundAssignment().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src,expected",
+        [
+            # A prefix operator, also after a cast or another prefix operator, belongs to its operand.
+            ("a = a * (int)-b;", "a *= (int)-b;"),
+            ("a = a - - -b;", "a -= - -b;"),
+            ("a = a * ~-b;", "a *= ~-b;"),
+            ("a = a * (undefined4 *)p;", "a *= (undefined4 *)p;"),
+            ("a = a + b++ * c;", "a += b++ * c;"),  # postfix `++`, then a binary `*`
+        ],
+    )
+    def test_prefix_operators_folded(self, src, expected) -> None:
+        assert CompoundAssignment().apply(src) == expected
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            # The `-`/`*` after these is binary and binds looser than or as tight as OP, so they must stay.
+            "a = a * (uint)-b + c;",  # the `-` is unary, the `+` is not
+            "a = a * sizeof(int) + 2;",  # `(int)` after `sizeof` is no cast
+            "a = a * (b) - c;",  # `(b)` may be a variable
+            "a = a * (x * y) - c;",  # an expression, not a pointer type
+            "a = a * f(x) - c;",  # a call
+            "a = a * *p + c;",
+            "a = a * b++ - c;",
+        ],
+    )
+    def test_binary_after_group_not_folded(self, src) -> None:
+        assert CompoundAssignment().apply(src) == src
+
+    def test_unbraced_body_not_folded(self) -> None:
+        # Known miss, safe: the control header becomes part of the target. In the pipeline `compound-assign` runs
+        # before `brace-elision`, so the body still has its braces (see test_t2.py).
+        assert CompoundAssignment().apply("if (c) a = a + 1;") == "if (c) a = a + 1;"

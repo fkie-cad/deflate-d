@@ -42,8 +42,8 @@ semantics-preserving but not information-preserving.
 | `ternary`              | Fold a same-target if/else assignment into a ternary.                                 |
 | `inline-temps`         | Inline a single-use spill temporary into its return.                                  |
 | `cast-elision`         | Collapse stacked identical casts.                                                     |
-| `brace-elision`        | Drop braces around a single-statement control block (if/else/for/while/do).           |
 | `compound-assign`      | Fold an expanded assignment into compound form.                                       |
+| `brace-elision`        | Drop braces around a single-statement control block (if/else/for/while/do).           |
 | `cfg-canon`            | Remove no-op gotos and unreferenced labels.                                           |
 | `int-minform`          | Re-spell a hex literal in decimal when shorter.                                       |
 | `deref-offset`         | Rewrite a dereferenced pointer-add as a subscript.                                    |

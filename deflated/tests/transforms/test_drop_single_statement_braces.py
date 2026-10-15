@@ -156,3 +156,84 @@ class TestDropSingleStatementBraces:
         # a second run must find nothing.
         once = DropSingleStatementBraces().apply(src)
         assert DropSingleStatementBraces().apply(once) == once
+
+    def test_no_whitespace_unwrapped(self) -> None:
+        # `{` and `}` are tokens of their own, so no whitespace is needed around them.
+        assert DropSingleStatementBraces().apply("if(c){x = 5;}") == "if(c) x = 5; "
+
+    def test_body_without_semicolon_kept(self) -> None:
+        # `x = 5` is not a complete statement, so the braces stay.
+        assert DropSingleStatementBraces().apply("if(c){x = 5}") == "if(c){x = 5}"
+
+    def test_comment_before_brace_unwrapped(self) -> None:
+        # A comment between `)` and `{` must not hide the `if` head.
+        out = DropSingleStatementBraces().apply("if (c) /* x */ { x = 1; }")
+        assert "{" not in out and "}" not in out
+        assert "/* x */" in out and "x = 1;" in out
+
+    def test_paren_in_condition_string_unwrapped(self) -> None:
+        # The `)` inside the string is part of the string token, so the head still matches back to `if (`.
+        out = DropSingleStatementBraces().apply('if (strcmp(s, ")")) { x = 1; }')
+        assert "{" not in out and "}" not in out
+        assert 'strcmp(s, ")")' in out
+
+    @pytest.mark.parametrize(
+        "src",
+        ["if (c) {} x = 1;", "if (c) {\n} x = 1;", "if (c) { /* nothing */ } x = 1;", "while (busy()) { } x = 1;"],
+    )
+    def test_empty_or_comment_only_body_kept(self, src) -> None:
+        # Without the braces the next statement would become the body.
+        assert DropSingleStatementBraces().apply(src) == src
+
+    @pytest.mark.parametrize("src", ['if (c) { char *s = "a;b"; }', "if (c) { char ch = ';'; }"])
+    def test_declaration_with_semicolon_in_literal_kept(self, src) -> None:
+        # The `;` inside the literal must not hide the declaration.
+        assert DropSingleStatementBraces().apply(src) == src
+
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "if (c) { int * x; }",
+            "if (c) { int x, y; }",
+            "if (c) { int (*fp)(int); }",
+            "if (c) { typeof(x) y; }",
+            "if (c) { _Atomic(int) x; }",
+        ],
+    )
+    def test_declaration_shapes_kept(self, src) -> None:
+        # `if (c) int x, y;` and the like are not valid C.
+        assert DropSingleStatementBraces().apply(src) == src
+
+    @pytest.mark.parametrize(
+        "src",
+        ["if (c) { std::string s; }", "if (c) { Foo<int> x; }", "if (c) { decltype(x) y; }"],
+    )
+    def test_cpp_declaration_kept(self, src) -> None:
+        # C++ allows `if (c) std::string s;`, but the pass cannot tell C++ from C, so it keeps the braces.
+        assert DropSingleStatementBraces().apply(src) == src
+
+    def test_ambiguous_multiply_or_declaration_kept(self) -> None:
+        # Without types, `a * b;` may declare a pointer `b`, so the braces stay.
+        src = "if (c) { a * b; }"
+        assert DropSingleStatementBraces().apply(src) == src
+
+    def test_compound_literal_body_kept(self) -> None:
+        # A body with braces is skipped, even when it is one statement.
+        src = "if (c) { x = (T){1, 2}; }"
+        assert DropSingleStatementBraces().apply(src) == src
+
+    def test_scope_operator_is_not_a_label(self) -> None:
+        out = DropSingleStatementBraces().apply("if (c) { std::f(); }")
+        assert "{" not in out and "std::f();" in out
+
+    @pytest.mark.parametrize("src", ["struct S { int x; };", "int a[] = { 1 };", "{ x = 1; }"])
+    def test_non_control_blocks_kept(self, src) -> None:
+        assert DropSingleStatementBraces().apply(src) == src
+
+    def test_stray_closing_brace_tolerated(self) -> None:
+        out = DropSingleStatementBraces().apply("if (c) { x = 1; } }")
+        assert out == "if (c)   x = 1;   }"
+
+    def test_missing_closing_brace_tolerated(self) -> None:
+        src = "if (c) { x = 1;"
+        assert DropSingleStatementBraces().apply(src) == src

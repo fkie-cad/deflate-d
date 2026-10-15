@@ -53,3 +53,10 @@ class TestTierT2:
 
     def test_string_safety(self) -> None:
         assert '"a  //  b"' in transform('char *s = "a  //  b";\n', Tier.T2_STRUCTURAL)
+
+    def test_compound_assign_folds_in_unbraced_bodies(self) -> None:
+        # `compound-assign` must run before `brace-elision`: once a body loses its braces, `if (c) a = a + 1;` is one
+        # statement whose target reads as `if (c) a`, and nothing folds.
+        src = "void f(int c){\n  if (c) {\n    a = a + 1;\n  }\n  else {\n    b = b - 2;\n  }\n}\n"
+        out = transform(src, Tier.T2_STRUCTURAL)
+        assert "a+=1;" in out and "b-=2;" in out

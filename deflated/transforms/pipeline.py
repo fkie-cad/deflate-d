@@ -95,8 +95,9 @@ ORDERED_TRANSFORMS: list[type[Transform]] = [
     TernaryFromIfElse,  # T2 (before inline: folds may expose a temp)
     InlineSingleUseTemps,  # T2 (before coalesce: dead decl still 1/line)
     RedundantCastElision,  # T2
+    CompoundAssignment,  # T2 (before brace-elision: `if (c) a = a + 1;` reads as one statement with target
+    #     `if (c) a` and no longer folds)
     DropSingleStatementBraces,  # T2
-    CompoundAssignment,  # T2
     CanonicalizeControlFlow,  # T2 (label/jump cleanup)
     MinimizeIntegerLiterals,  # T2 (hex int literals -> shorter decimal; lossless)
     DerefOffsetToIndex,  # T2 (*(p+N) -> p[N]; lossless)

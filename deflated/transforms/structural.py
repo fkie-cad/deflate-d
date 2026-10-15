@@ -23,7 +23,6 @@ from .ctokens import (
     has_top_level_token,
     match_delimiter,
     split_statements,
-    word_before,
 )
 from .lexer import SegmentType, scan, strip_comments
 
@@ -37,46 +36,23 @@ _STMT_KW = frozenset(
     | {"delete", "throw", "new", "co_return", "co_yield", "co_await", "using", "namespace"}
 )
 
-# A local declaration: `int x;`, `int x[3];` or `int x = 1;`. It starts with two or more words (`type [*]name`), which
-# an assignment or any other expression statement never does.
-_DECL = re.compile(r"^[A-Za-z_][A-Za-z0-9_ ]*\s+\**[A-Za-z_]\w*(?:\s*\[[^\];]*\])*\s*(?:=[^;]*)?;$")
+# The assignment operators: a side effect wherever they appear.
+_ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
 
-# Binary operators with a compound-assignment form (`a = a OP b` -> `a OP= b`).
-_COMPOUND_OPS = frozenset("+ - * / % & | ^ << >>".split())
+# Words that only name a type, so a `(...)` group holding one is a cast.
+_TYPE_WORDS = frozenset(
+    "int char long short void unsigned signed float double bool "
+    "uint ulong ushort uchar byte sbyte undefined "
+    "size_t wchar_t".split()
+)
 
 # One leading goto label such as `LABEL_3:` (not C++ `::`); group 1 is its name.
 _LABEL_PREFIX = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*")
 
-# C binary-operator precedence (smaller binds tighter). `compound-assign` uses it to check that `a = a OP rest` ->
-# `a OP= rest` does not regroup `rest`.
-_PRECEDENCE = {
-    "*": 3,
-    "/": 3,
-    "%": 3,
-    "+": 4,
-    "-": 4,
-    "<<": 5,
-    ">>": 5,
-    "<": 6,
-    "<=": 6,
-    ">": 6,
-    ">=": 6,
-    "==": 7,
-    "!=": 7,
-    "&": 8,
-    "^": 9,
-    "|": 10,
-    "&&": 11,
-    "||": 12,
-    "?": 13,
-    ":": 13,
-    ",": 14,
-}
-
-# Operators that may repeat in a folded chain `a = a OP b OP c`, because they are associative for every operand type.
-# Only the bitwise ones qualify. `+` and `*` also apply to floats, where `(a+b)+c` and `a+(b+c)` round differently, and
-# the pass cannot tell a float from an int. `a = a + b` and `a = a + b*c` still fold: neither regroups.
-_ASSOCIATIVE_OPS = frozenset({"&", "|", "^"})
+# An identifier, and the keywords that may stand before a unary `*` and are never an operand value. (Numbers are
+# matched with `CINT`.)
+_IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
+_NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
 def _split_leading_labels(statement: str) -> Tuple[str, str]:
@@ -94,24 +70,17 @@ def _split_leading_labels(statement: str) -> Tuple[str, str]:
     return statement[:prefix_length], statement[prefix_length:]
 
 
-def _strip_leading_labels(statement: str) -> str:
-    """Return `statement` without its leading goto labels (see `_split_leading_labels`)."""
-    return _split_leading_labels(statement)[1]
-
-
-def _squash(text: str) -> str:
-    """Return `text` without whitespace, so `char *` and `char*` compare equal."""
-    return re.sub(r"\s+", "", text)
-
-
-def _looks_like_decl(statement: str, first_word: str) -> bool:
-    """
-    True if `statement`, whose first word is `first_word`, is a local declaration, which C does not allow as a control
-    body.
-    """
-    if first_word in _CTRL_KW or first_word in _STMT_KW:
-        return False
-    return bool(_DECL.match(statement))
+def _open_paren(tokens: List[CToken], start: int, close: int) -> Optional[int]:
+    """Return the index of the `(` that matches the `)` at `close`, searching back to `start`, or None."""
+    depth = 0
+    for index in range(close, start - 1, -1):
+        if tokens[index].text == ")":
+            depth += 1
+        elif tokens[index].text == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
 class NormalizeFlagTemps(Transform):
@@ -225,12 +194,14 @@ class DropSingleStatementBraces(Transform):
     """
     Remove the braces of a control block that holds one simple statement: `if (c) { x = 1; }` -> `if (c) x = 1;`.
 
-    Works for `if`, `else`, `for`, `while` and `do`. These blocks keep their braces:
-
-    * Other blocks: function, struct and enum bodies, initializers, plain scope blocks and `switch` bodies.
-    * A body that starts with a control keyword: in `if (a) { if (b) f(); } else g();` the `else` would move to the
-      inner `if`.
-    * A body that is a declaration: `if (c) int x;` is not valid C.
+    Works for `if`, `else`, `for`, `while` and `do`.
+    These blocks keep their braces:
+        * Other blocks: function, struct and enum bodies, initializers, plain scope blocks and `switch` bodies.
+        * A body that starts with a control keyword: in `if (a) { if (b) f(); } else g();` the `else` would move to the
+          inner `if`.
+        * A body that is a declaration: `if (c) int x;` is not valid C. Without types, `a * b;` may declare `b`, so it
+          counts as one too.
+        * A body with braces in it, such as a compound literal `x = (T){1};`.
 
     Strippable blocks never contain braces, so all pairs from one scan are disjoint and are removed right to left in
     a single pass.
@@ -241,9 +212,7 @@ class DropSingleStatementBraces(Transform):
     description = "Drop braces around a single-statement control block (if/else/for/while/do)."
 
     def apply(self, code: str) -> str:
-        """
-        Return `code` with the braces of every strippable control block replaced by spaces.
-        """
+        """Return `code` with the braces of every strippable control block replaced by spaces."""
         # One pass is enough: unwrapping an inner block never makes the outer one strippable, since the outer body then
         # starts with a control keyword.
         for open_offset, close_offset in sorted(self._strippable_pairs(code), reverse=True):
@@ -254,93 +223,103 @@ class DropSingleStatementBraces(Transform):
     def _strippable_pairs(self, code: str) -> List[Tuple[int, int]]:
         """
         Return the offsets of the `{` and `}` of every control block that holds one simple statement.
-        """
-        # Non-whitespace code characters and their offsets. Strings and comments are skipped, so their braces are
-        # ignored.
-        characters: List[str] = []
-        offsets: List[int] = []
-        offset = 0
-        for seg_type, text in scan(code):
-            if seg_type == SegmentType.CODE:
-                for character in text:
-                    if not character.isspace():
-                        characters.append(character)
-                        offsets.append(offset)
-                    offset += 1
-            else:
-                offset += len(text)
 
+        Braces are matched on the C tokens, so a brace in a string or comment is ignored and `_is_control_block` can
+        look back past whitespace and comments (`if (c) /* x */ {`). Pairs are listed in the order of their `}`.
+        """
+        # A comment is one opaque token; drop it so the token before a `{` is the code in front of it.
+        tokens = [token for token in ctokenize(code) if not token.text.startswith(("//", "/*"))]
         open_indices: List[int] = []
         pairs: List[Tuple[int, int]] = []
-        for index, character in enumerate(characters):
-            if character == "{":
+        for index, token in enumerate(tokens):
+            if token.text == "{":
                 open_indices.append(index)
-            elif character == "}" and open_indices:
+            elif token.text == "}" and open_indices:
                 open_index = open_indices.pop()
-                if not self._is_control_block(characters, open_index):
+                if not self._is_control_block(tokens, open_index):
                     continue
-                open_offset, close_offset = offsets[open_index], offsets[index]
-                if self._single_simple(code[open_offset + 1 : close_offset]):
-                    pairs.append((open_offset, close_offset))
+                if self._single_simple(tokens[open_index + 1 : index]):
+                    pairs.append((tokens[open_index].start, token.start))
         return pairs
 
     @staticmethod
-    def _is_control_block(characters: List[str], brace_index: int) -> bool:
-        """
-        True if the `{` at `characters[brace_index]` opens a control block.
-        """
+    def _is_control_block(tokens: List[CToken], brace_index: int) -> bool:
+        """True if the `{` at `tokens[brace_index]` opens a control block."""
         if brace_index == 0:
             return False
-        if characters[brace_index - 1] == ")":
-            depth, paren_index = 0, brace_index - 1
-            while paren_index >= 0:
-                if characters[paren_index] == ")":
-                    depth += 1
-                elif characters[paren_index] == "(":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                paren_index -= 1
-            if paren_index < 0:
+        before = tokens[brace_index - 1].text
+        if before == ")":
+            paren_index = _open_paren(tokens, 0, brace_index - 1)
+            if paren_index is None or paren_index == 0:
                 return False
-            # `characters` has no whitespace, so `else if` reads as `elseif`, which is treated like `if`. `switch` is
-            # left out: a body with a `case` label needs its braces (`switch(x)case 1:...` is invalid C), and
-            # `_single_simple` keeps labels attached.
-            return word_before(characters, paren_index) in {"if", "for", "while", "elseif"}
-        return word_before(characters, brace_index) in {"else", "do"}
+            # `switch` is left out: a body with a `case` label needs its braces (`switch(x)case 1:...` is invalid C)
+            return tokens[paren_index - 1].text in {"if", "for", "while"}
+        return before in {"else", "do"}
+
+    @classmethod
+    def _single_simple(cls, body: List[CToken]) -> bool:
+        """True if the tokens `body` are one statement that is neither a control statement nor a declaration."""
+        texts = [token.text for token in body]
+        # Braces mean a nested block or a brace expression (`(T){1}`); skip rather than reason about them.
+        if not texts or texts[-1] != ";" or "{" in texts or "}" in texts:
+            return False
+        if has_top_level_token(body, 0, len(body) - 1, frozenset({";"})):
+            return False  # more than one statement
+        # Skip leading goto labels (`L: if (b) ...;`), or a labeled inner `if` would pass the dangling-else check.
+        first = 0
+        while (
+            _IDENT_RX.match(texts[first])
+            and texts[first] not in ("case", "default")
+            and texts[first + 1] == ":"
+            and texts[first + 2] != ":"  # not C++ `::`
+        ):
+            first += 2
+        if texts[first] in _CTRL_KW:
+            return False
+        # `if (c) int x;` is not valid C.
+        return texts[first] in _STMT_KW or not cls._looks_like_declaration(texts[first:])
+
+    @classmethod
+    def _looks_like_declaration(cls, texts: List[str]) -> bool:
+        """
+        True if the statement `texts` may be a declaration: a type, any `*` or `&`, then a name (`int x, y;`) or a
+        pointer in parentheses (`int (*fp)(int);`). The type may have `ns::` parts, `<...>` arguments, or one `(...)`
+        right after its first word (`typeof(x) y;`).
+
+        Without types, `a * b;` also reads as a declaration; that only keeps braces that could have gone.
+        """
+        if not _IDENT_RX.match(texts[0]):
+            return False
+        index = 1
+        while index is not None:
+            if texts[index : index + 2] == [":", ":"] and _IDENT_RX.match(texts[index + 2]):
+                index += 3
+            elif texts[index] == "<" or (index == 1 and texts[index] == "(" and texts[index + 1] != "*"):
+                index = cls._skip_group(texts, index)
+            else:
+                break
+        if index is None:
+            return False  # `a < b;` is a comparison
+        while texts[index] in ("*", "&"):
+            index += 1
+        if texts[index : index + 2] != ["(", "*"]:
+            return bool(_IDENT_RX.match(texts[index]))
+        # `(*name)(` or `(*name)[`; `f(*p);` is a call.
+        index += 2
+        while texts[index] == "*":
+            index += 1
+        return bool(_IDENT_RX.match(texts[index])) and texts[index + 1 : index + 3] in ([")", "("], [")", "["])
 
     @staticmethod
-    def _single_simple(body: str) -> bool:
-        """
-        True if `body` is one statement that is neither a control statement nor a declaration.
-        """
-        code_only = "".join(text for seg_type, text in scan(body) if seg_type == SegmentType.CODE)
-        if "{" in code_only or "}" in code_only:
-            return False
-        statement = code_only.strip()
-        if not statement:
-            return False
-        depth = semicolons = 0
-        ends_with_semicolon = False
-        last_index = len(statement) - 1
-        for index, character in enumerate(statement):
-            if character in "([":
-                depth += 1
-            elif character in ")]":
-                depth = max(0, depth - 1)
-            elif character == ";" and depth == 0:
-                semicolons += 1
-                ends_with_semicolon = index == last_index
-        if semicolons != 1 or not ends_with_semicolon:
-            return False
-        # Skip leading goto labels (`LABEL_3: if (b) ...;`) to find the first real word. Otherwise a labeled inner `if`
-        # would pass the dangling-else check, lose its braces, and an outer `else` would bind to it.
-        unlabeled = _strip_leading_labels(statement)
-        word_match = re.match(r"[A-Za-z_]\w*", unlabeled)
-        first_word = word_match.group(0) if word_match else ""
-        if first_word in _CTRL_KW:
-            return False
-        return not _looks_like_decl(unlabeled, first_word)
+    def _skip_group(texts: List[str], index: int) -> Optional[int]:
+        """Return the index after the `>` or `)` that closes the `<` or `(` at `texts[index]`, or None if none does."""
+        depth_change = {"<": 1, ">": -1, ">>": -2} if texts[index] == "<" else {"(": 1, ")": -1}
+        depth = 0
+        for close in range(index, len(texts)):
+            depth += depth_change.get(texts[close], 0)
+            if depth <= 0:
+                return close + 1
+        return None
 
 
 class CompoundAssignment(Transform):
@@ -348,92 +327,171 @@ class CompoundAssignment(Transform):
     Fold `a = a OP b;` into `a OP= b;` (`iVar1 = iVar1 + iVar4;` -> `iVar1 += iVar4;`).
 
     The right side must start with exactly the tokens of the target, so `a->b` or `a + +b` is never read as `a`
-    followed by an operator. The target is evaluated once instead of twice, so it may not contain `++`, `--` or a
-    call: `*(int *)(p + i * 4)` folds, `*p++` does not. The rest of the right side must bind tighter than OP (see
-    `_remainder_safe`), since the fold regroups it.
+    followed by an operator. The target is evaluated once instead of twice, so it may not contain `++`, `--`, an
+    assignment or a call: `*(int *)(p + i * 4)` folds, `*p++` and `a[i += 1]` do not. The rest of the right side must
+    bind tighter than OP (see `_remainder_safe`), since the fold regroups it.
     """
 
     id = "compound-assign"
     tier = Tier.T2_STRUCTURAL
     description = "Fold an expanded assignment into compound form."
 
+    # Binary operators with a compound-assignment form (`a = a OP b` -> `a OP= b`).
+    _COMPOUND_OPS = frozenset({"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"})
+
+    # C precedence levels (smaller binds tighter); levels 1-2 (postfix/unary) are omitted, see `_remainder_safe`.
+    _PRECEDENCE = {
+        "*": 3,
+        "/": 3,
+        "%": 3,
+        "+": 4,
+        "-": 4,
+        "<<": 5,
+        ">>": 5,
+        "<": 6,
+        "<=": 6,
+        ">": 6,
+        ">=": 6,
+        "==": 7,
+        "!=": 7,
+        "&": 8,
+        "^": 9,
+        "|": 10,
+        "&&": 11,
+        "||": 12,
+        "?": 13,
+        ":": 13,
+        ",": 14,
+    }
+
+    # Operators that may repeat in a folded chain `a = a OP b OP c`: associative for every type. `+` and `*` are not,
+    # since float rounding depends on grouping and the pass cannot tell a float from an int.
+    _ASSOCIATIVE_OPS = frozenset({"&", "|", "^"})
+
+    # Operators that may stand in front of an operand.
+    _PREFIX_OPS = frozenset({"-", "+", "*", "&", "!", "~", "++", "--"})
+
     def apply(self, code: str) -> str:
-        """
-        Return `code` with every foldable `a = a OP b;` written as `a OP= b;`.
-        """
+        """Return `code` with every foldable `a = a OP b;` written as `a OP= b;`."""
+        code = self._fold_for_increments(code)
         return "".join(self._rewrite(piece) for piece in split_statements(code))
 
     def _rewrite(self, piece: str) -> str:
-        """
-        Return `piece` in compound form if it is a foldable `a = a OP b;`, else unchanged.
-        """
-        stripped = piece.rstrip()
-        if not stripped.endswith(";"):
+        """Return `piece` in compound form if it is a foldable `a = a OP b;`, else unchanged."""
+        statement_match = re.fullmatch(r"(\s*)(.*);(\s*)", piece, re.DOTALL)
+        if statement_match is None:
             return piece
-        indent_length = len(piece) - len(piece.lstrip())
-        indent = piece[:indent_length]
-        trailing = piece[len(stripped) :]
-        statement = stripped[indent_length:-1]  # the statement without leading whitespace and `;`
+        indent, statement, trailing = statement_match.groups()
+        folded = self._fold(statement)
+        return piece if folded is None else f"{indent}{folded};{trailing}"
 
-        # Set leading goto labels aside and put them back in front of the result.
-        labels, assignment = _split_leading_labels(statement)
+    def _fold_for_increments(self, code: str) -> str:
+        """
+        Return `code` with the increment of every `for` header folded: `for (i = 0; i < n; i = i + 1)` ->
+        `for (i = 0; i < n; i += 1)`. `split_statements` does not split inside `(...)`, so `_rewrite` never sees it.
+        """
+        tokens = ctokenize(code)
+        edits: List[Tuple[int, int, str]] = []
+        for index, token in enumerate(tokens):
+            if token.text != "for" or index + 1 >= len(tokens) or tokens[index + 1].text != "(":
+                continue
+            close_index = match_delimiter(tokens, index + 1)
+            if close_index is None:
+                continue
+            # The two `;` of the header, at its own depth.
+            depth, semicolons = 0, []
+            for inner in range(index + 2, close_index):
+                if tokens[inner].text in ("(", "[", "{"):
+                    depth += 1
+                elif tokens[inner].text in (")", "]", "}"):
+                    depth -= 1
+                elif tokens[inner].text == ";" and depth == 0:
+                    semicolons.append(inner)
+            if len(semicolons) != 2:
+                continue
+            # The increment clause without its surrounding whitespace, which stays untouched.
+            start, end = tokens[semicolons[1]].end, tokens[close_index].start
+            clause = code[start:end]
+            start += len(clause) - len(clause.lstrip())
+            end = max(start, end - (len(clause) - len(clause.rstrip())))
+            folded = self._fold(code[start:end])
+            if folded is not None:
+                edits.append((start, end, folded))
+        for start, end, text in reversed(edits):
+            code = code[:start] + text + code[end:]
+        return code
 
-        tokens = ctokenize(assignment)
+    def _fold(self, statement: str) -> Optional[str]:
+        """
+        Return `statement` (without its `;`) in compound form if it is a foldable `a = a OP b`, else None. Leading
+        `case`, `default` and goto labels are kept in front.
+        """
+        tokens = ctokenize(statement)
+        tokens = tokens[self._labels_end(tokens) :]
+        if not tokens:
+            return None
+        labels = statement[: tokens[0].start]
+
         assign_index = self._assign_index(tokens)
-        if assign_index <= 0:  # no top-level `=`, or nothing to its left
-            return piece
-        lhs_texts = [token.text for token in tokens[:assign_index]]
-        if not self._pure_lvalue(lhs_texts):
-            return piece
-
+        lhs_texts = [token.text for token in tokens[:assign_index]] if assign_index > 0 else []
         rhs_tokens = tokens[assign_index + 1 :]
-        lhs_length = len(lhs_texts)
-        if len(rhs_tokens) <= lhs_length or [token.text for token in rhs_tokens[:lhs_length]] != lhs_texts:
-            return piece
-        operator = rhs_tokens[lhs_length].text
-        if operator not in _COMPOUND_OPS:
-            return piece
-        if not self._remainder_safe(operator, rhs_tokens[lhs_length + 1 :]):
-            return piece
-        remainder = assignment[rhs_tokens[lhs_length].end :].strip()
-        if not remainder:
-            return piece
+        op_index = len(lhs_texts)  # the right side repeats the target, then OP
+        if not (
+            len(rhs_tokens) > op_index + 1  # the target, OP and a non-empty remainder
+            and rhs_tokens[op_index].text in self._COMPOUND_OPS  # the token after the repeated target is OP
+            and [token.text for token in rhs_tokens[:op_index]] == lhs_texts  # the right side starts with the target
+            and self._pure_lvalue(lhs_texts)  # False for an empty target, so no `=` stops here
+            and self._remainder_safe(rhs_tokens[op_index].text, rhs_tokens[op_index + 1 :])
+        ):
+            return None
 
-        lhs = assignment[: tokens[assign_index].start].strip()
-        return f"{indent}{labels}{lhs} {operator}= {remainder};{trailing}"
+        operator = rhs_tokens[op_index]
+        lhs = statement[tokens[0].start : tokens[assign_index].start].strip()
+        remainder = statement[operator.end :].strip()
+        return f"{labels}{lhs} {operator.text}= {remainder}"
 
     @staticmethod
-    def _remainder_safe(operator: str, remainder_tokens: List[CToken]) -> bool:
-        """
-        True if `a OP= rem` means the same as `a = a OP rem`, where OP is `operator` and rem is `remainder_tokens`.
-
-        The fold regroups `a OP rem` as `a OP (rem)`. That is only the same if every top-level binary operator in `rem`
-        binds tighter than OP, or is OP itself and associative: `a - b - c` and `a * b + c` do not fold. A unary
-        operator (one not after an operand) belongs to its operand, and `->` and `.` are not split on.
-        """
-        depth = 0
-        after_operand = False
-        for token in remainder_tokens:
-            if token.text in ("(", "[", "{"):
-                depth += 1
-                after_operand = False
-            elif token.text in (")", "]", "}"):
-                depth -= 1
-                after_operand = True
-            elif depth == 0 and after_operand and token.text in _PRECEDENCE:
-                binds_tighter = _PRECEDENCE[token.text] < _PRECEDENCE[operator]
-                if not (binds_tighter or (token.text == operator and operator in _ASSOCIATIVE_OPS)):
-                    return False
-                after_operand = False
+    def _labels_end(tokens: List[CToken]) -> int:
+        """Return the index of the first token after the leading `case`, `default` and goto labels."""
+        index = 0
+        while index + 1 < len(tokens):
+            if tokens[index].text == "case":
+                # The `:` ending the label is the first one at depth 0 that closes no `?` and is not half of a `::`.
+                depth = open_questions = 0
+                colon_index = None
+                inner = index + 1
+                while inner < len(tokens) and colon_index is None:
+                    text = tokens[inner].text
+                    if text in ("(", "[", "{"):
+                        depth += 1
+                    elif text in (")", "]", "}"):
+                        depth -= 1
+                    elif depth == 0 and text == "?":
+                        open_questions += 1
+                    elif depth == 0 and text == ":":
+                        if inner + 1 < len(tokens) and tokens[inner + 1].text == ":":
+                            inner += 1  # `::`
+                        elif open_questions:
+                            open_questions -= 1
+                        else:
+                            colon_index = inner
+                    inner += 1
+                if colon_index is None:
+                    break
+                index = colon_index + 1
+            elif (
+                _IDENT_RX.match(tokens[index].text)  # a goto label or `default`
+                and tokens[index + 1].text == ":"
+                and not (index + 2 < len(tokens) and tokens[index + 2].text == ":")  # not `::`
+            ):
+                index += 2
             else:
-                after_operand = True
-        return True
+                break
+        return index
 
     @staticmethod
     def _assign_index(tokens: List[CToken]) -> int:
-        """
-        Return the index of the first top-level `=` token, or -1.
-        """
+        """Return the index of the first top-level `=` token, or -1."""
         depth = 0
         for index, token in enumerate(tokens):
             if token.text in ("(", "[", "{"):
@@ -447,14 +505,65 @@ class CompoundAssignment(Transform):
     @staticmethod
     def _pure_lvalue(lhs_texts: List[str]) -> bool:
         """
-        True if the target `lhs_texts` has no `++`, `--` or call, so evaluating it once instead of twice is the same.
+        True if the target `lhs_texts` has no `++`, `--`, assignment or call, so evaluating it once instead of twice is
+        the same.
         """
-        if not lhs_texts or "++" in lhs_texts or "--" in lhs_texts:
+        if not lhs_texts or any(text in ("++", "--") or text in _ASSIGN_OPS for text in lhs_texts):
             return False
         for left, right in zip(lhs_texts, lhs_texts[1:]):
             if right == "(" and re.fullmatch(r"[A-Za-z_]\w*", left):
                 return False  # a name followed by `(` is a call
         return lhs_texts[0] in ("*", "(") or bool(re.fullmatch(r"[A-Za-z_]\w*", lhs_texts[0]))
+
+    @classmethod
+    def _remainder_safe(cls, operator: str, remainder_tokens: List[CToken]) -> bool:
+        """
+        True if `a OP= rem` means the same as `a = a OP rem`, where OP is `operator` and rem is `remainder_tokens`.
+
+        The fold regroups `a OP rem` as `a OP (rem)`. That is only the same if every top-level binary operator in `rem`
+        binds tighter than OP, or is OP itself and associative: `a - b - c` and `a * b + c` do not fold. A unary
+        operator (one where no operator is expected) belongs to its operand, and `->` and `.` are not split on.
+        After a cast `(T)` an operand follows, so `-` in `(int)-b` is unary; `(x)-b` is not a cast (see `_is_cast`).
+        """
+        depth = 0
+        expects_operator = False
+        # For each open bracket: its index, and whether it stood where an operand was expected (a possible cast).
+        open_brackets: List[Tuple[int, bool]] = []
+        for index, token in enumerate(remainder_tokens):
+            if token.text in ("(", "[", "{"):
+                depth += 1
+                open_brackets.append((index, not expects_operator))
+                expects_operator = False
+            elif token.text in (")", "]", "}"):
+                depth -= 1
+                open_index, operand_position = open_brackets.pop() if open_brackets else (index, False)
+                group_texts = [inner.text for inner in remainder_tokens[open_index + 1 : index]]
+                expects_operator = not (token.text == ")" and operand_position and cls._is_cast(group_texts))
+            elif not expects_operator and token.text in cls._PREFIX_OPS:
+                pass  # a prefix operator; its operand follows
+            elif depth == 0 and expects_operator and token.text in cls._PRECEDENCE:
+                binds_tighter = cls._PRECEDENCE[token.text] < cls._PRECEDENCE[operator]
+                if not (binds_tighter or (token.text == operator and operator in cls._ASSOCIATIVE_OPS)):
+                    return False
+                expects_operator = False
+            else:
+                expects_operator = True
+        return True
+
+    @staticmethod
+    def _is_cast(group_texts: List[str]) -> bool:
+        """
+        True if the token texts `group_texts` inside a `(...)` can only be a type: names followed by `*`s, with a known
+        type word or at least one `*` (`(int)`, `(undefined4 *)`). `(x)` may be a variable and `(x * y)` is an
+        expression, so neither counts.
+        """
+        name_count = 0
+        while name_count < len(group_texts) and _IDENT_RX.match(group_texts[name_count]):
+            name_count += 1
+        stars = group_texts[name_count:]
+        if name_count == 0 or any(text != "*" for text in stars):
+            return False
+        return bool(stars) or any(text in _TYPE_WORDS for text in group_texts)
 
 
 class RedundantCastElision(Transform):
@@ -468,12 +577,6 @@ class RedundantCastElision(Transform):
     id = "cast-elision"
     tier = Tier.T2_STRUCTURAL
     description = "Collapse stacked identical casts."
-
-    _TYPE_WORDS = frozenset(
-        "int char long short void unsigned signed float double bool "
-        "uint ulong ushort uchar byte sbyte undefined "
-        "size_t wchar_t".split()
-    )
 
     def apply(self, code: str) -> str:
         """
@@ -517,7 +620,7 @@ class RedundantCastElision(Transform):
         # A type never starts with `*`; `(*fp)` is a dereferenced function pointer.
         if type_texts[0] == "*" or "," in type_texts or "?" in type_texts:
             return False
-        return "*" in type_texts or any(text in cls._TYPE_WORDS for text in type_texts)
+        return "*" in type_texts or any(text in _TYPE_WORDS for text in type_texts)
 
 
 class InlineSingleUseTemps(Transform):
@@ -596,7 +699,7 @@ class InlineSingleUseTemps(Transform):
                         declaration = pieces[decl_indices[0]]
                         temp_type = declaration[: self._DECL.match(declaration).start("name")].strip()
                         return_type = self._return_type(code, sum(len(piece) for piece in pieces[:index]))
-                        if return_type is None or _squash(return_type) != _squash(temp_type):
+                        if return_type is None or self._squash(return_type) != self._squash(temp_type):
                             value = f"({temp_type}){self._as_operand(value)}"
                     pieces[index] = f"{assign_match.group(1)}return {value};{return_match.group(2)}"
                     keep[index + 1] = False
@@ -639,6 +742,11 @@ class InlineSingleUseTemps(Transform):
         return " ".join(words) or None
 
     @staticmethod
+    def _squash(text: str) -> str:
+        """Return `text` without whitespace, so `char *` and `char*` compare equal."""
+        return re.sub(r"\s+", "", text)
+
+    @staticmethod
     def _as_operand(expr: str) -> str:
         """
         Return `expr` as a cast operand: unchanged if it is one token or a call, else parenthesised.
@@ -654,127 +762,6 @@ class InlineSingleUseTemps(Transform):
         ):
             return expr
         return f"({expr})"
-
-
-# Helpers for `TernaryFromIfElse`, on the tokens from `ctokenize`.
-def _parse_assign(tokens: List[CToken], start: int, end: int) -> Optional[Tuple[int, int, int, int]]:
-    """
-    If `tokens[start:end]` is one assignment `LV = RHS` (with an optional `;`), return the token spans
-    `(lv_start, lv_end, rhs_start, rhs_end)`, else None.
-    """
-    if end > start and tokens[end - 1].text == ";":
-        end -= 1
-    depth, assign_index = 0, None
-    for index in range(start, end):
-        text = tokens[index].text
-        if text in "([{":
-            depth += 1
-        elif text in ")]}":
-            depth -= 1
-        elif depth == 0 and text == ";":
-            return None  # more than one statement
-        elif depth == 0 and text == "=":
-            if assign_index is not None:
-                return None  # chained assignment
-            assign_index = index
-    if assign_index is None or assign_index == start or assign_index + 1 >= end:
-        return None
-    return start, assign_index, assign_index + 1, end
-
-
-def _branch(tokens: List[CToken], start: int) -> Optional[Tuple[Optional[Tuple[int, int, int, int]], int, int]]:
-    """
-    Parse the then or else branch, braced or not, that starts at token `start`.
-
-    Return `(spans, after, end)`: `spans` from `_parse_assign`, or None if the branch is not exactly one assignment;
-    `after` is the index of the token after the branch and `end` the offset where it ends. Return None if there is no
-    complete branch.
-    """
-    token_count = len(tokens)
-    if start >= token_count:
-        return None
-    if tokens[start].text == "{":
-        close = match_delimiter(tokens, start)
-        if close is None:
-            return None
-        return _parse_assign(tokens, start + 1, close), close + 1, tokens[close].end
-    depth, index = 0, start
-    while index < token_count:
-        text = tokens[index].text
-        if text in "([{":
-            depth += 1
-        elif text in ")]}":
-            depth -= 1
-        elif depth == 0 and text == ";":
-            return _parse_assign(tokens, start, index), index + 1, tokens[index].end
-        index += 1
-    return None
-
-
-# Top-level tokens that block the fold in the condition or a branch: `?` and `,` would regroup once inlined, and so
-# would a bare `=` in the condition (`if (a = b) ...`), which binds looser than `?:`. `==` is its own token and folds.
-_TERNARY_UNSAFE = frozenset({"?", ",", "="})
-_ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
-# The condition may not hold a top-level compound assignment either, for the same reason.
-_COND_UNSAFE = _TERNARY_UNSAFE | _ASSIGN_OPS
-# Tokens through which a condition may read memory that an update in the lvalue changes.
-_INDIRECT = frozenset({"*", "->", "["})
-
-
-def _has_update(tokens: List[CToken], start: int, end: int) -> bool:
-    """
-    True if `tokens[start:end]` holds `++`, `--` or an assignment, at any depth.
-    """
-    return any(token.text in ("++", "--") or token.text in _ASSIGN_OPS for token in tokens[start:end])
-
-
-def _has_call(tokens: List[CToken], start: int, end: int) -> bool:
-    """
-    True if `tokens[start:end]` holds a call, at any depth: `name(`, `tab[0](` or `(*fp)(`.
-
-    `sizeof(` and casts are not calls; a `(...)` group before `(` is a callee only if it starts with `*`, which a type
-    never does. `(fp)(x)` cannot be told from a cast and is not counted.
-    """
-    for index in range(start + 1, end):
-        if tokens[index].text != "(":
-            continue
-        before = tokens[index - 1].text
-        if before == "]" or (_IDENT_RX.match(before) and before not in _NONVALUE_KW):
-            return True
-        if before == ")":
-            opener = _open_paren(tokens, start, index - 1)
-            if opener is not None and tokens[opener + 1].text == "*":
-                return True
-    return False
-
-
-def _open_paren(tokens: List[CToken], start: int, close: int) -> Optional[int]:
-    """
-    Return the index of the `(` that matches the `)` at `close`, searching back to `start`, or None.
-    """
-    depth = 0
-    for index in range(close, start - 1, -1):
-        if tokens[index].text == ")":
-            depth += 1
-        elif tokens[index].text == "(":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
-
-
-def _has_side_effect(tokens: List[CToken], start: int, end: int) -> bool:
-    """
-    True if `tokens[start:end]` holds `++`, `--`, an assignment or a call, at any depth.
-    """
-    return _has_update(tokens, start, end) or _has_call(tokens, start, end)
-
-
-def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
-    """
-    The identifiers in `tokens[start:end]`, keywords excluded.
-    """
-    return {token.text for token in tokens[start:end] if _IDENT_RX.match(token.text) and token.text not in _NONVALUE_KW}
 
 
 class TernaryFromIfElse(Transform):
@@ -797,6 +784,15 @@ class TernaryFromIfElse(Transform):
     id = "ternary"
     tier = Tier.T2_STRUCTURAL
     description = "Fold a same-target if/else assignment into a ternary."
+
+    # Top-level tokens that block the fold in the condition or a branch: `?` and `,` would regroup once inlined, and so
+    # would a bare `=` in the condition (`if (a = b) ...`), which binds looser than `?:`. `==` is its own token and
+    # folds.
+    _TERNARY_UNSAFE = frozenset({"?", ",", "="})
+    # The condition may not hold a top-level compound assignment either, for the same reason.
+    _COND_UNSAFE = _TERNARY_UNSAFE | _ASSIGN_OPS
+    # Tokens through which a condition may read memory that an update in the lvalue changes.
+    _INDIRECT = frozenset({"*", "->", "["})
 
     def apply(self, code: str) -> str:
         """
@@ -826,7 +822,7 @@ class TernaryFromIfElse(Transform):
             if cond_end is None or cond_end <= cond_start:  # need a non-empty condition
                 index += 1
                 continue
-            then_branch = _branch(tokens, cond_end + 1)
+            then_branch = self._branch(tokens, cond_end + 1)
             if not then_branch or then_branch[0] is None:
                 index += 1
                 continue
@@ -834,7 +830,7 @@ class TernaryFromIfElse(Transform):
             if after_then >= token_count or tokens[after_then].text != "else":
                 index += 1
                 continue
-            else_branch = _branch(tokens, after_then + 1)
+            else_branch = self._branch(tokens, after_then + 1)
             if not else_branch or else_branch[0] is None:
                 index += 1
                 continue
@@ -848,21 +844,21 @@ class TernaryFromIfElse(Transform):
                 index += 1
                 continue
             if (
-                has_top_level_token(tokens, cond_start, cond_end, _COND_UNSAFE)
-                or has_top_level_token(tokens, then_start, then_end, _TERNARY_UNSAFE)
-                or has_top_level_token(tokens, else_start, else_end, _TERNARY_UNSAFE)
+                has_top_level_token(tokens, cond_start, cond_end, self._COND_UNSAFE)
+                or has_top_level_token(tokens, then_start, then_end, self._TERNARY_UNSAFE)
+                or has_top_level_token(tokens, else_start, else_end, self._TERNARY_UNSAFE)
             ):
                 index += 1
                 continue
             # The if runs the condition before the lvalue; `LV = C ? A : B` does not fix their order. An update in
             # the lvalue can only reach the condition through a shared name or memory read via `*`, `->`, `[`.
-            shared = _identifiers(tokens, cond_start, cond_end) & _identifiers(tokens, lv_start, lv_end)
+            shared = self._identifiers(tokens, cond_start, cond_end) & self._identifiers(tokens, lv_start, lv_end)
             lv_is_name = lv_end - lv_start == 1 and _IDENT_RX.match(tokens[lv_start].text)
-            cond_reads_memory = any(token.text in _INDIRECT for token in tokens[cond_start:cond_end])
+            cond_reads_memory = any(token.text in self._INDIRECT for token in tokens[cond_start:cond_end])
             if (
-                (_has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
-                or _has_call(tokens, lv_start, lv_end)
-                or (_has_update(tokens, lv_start, lv_end) and (shared or cond_reads_memory))
+                (self._has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
+                or self._has_call(tokens, lv_start, lv_end)
+                or (self._has_update(tokens, lv_start, lv_end) and (shared or cond_reads_memory))
             ):
                 index += 1
                 continue
@@ -874,6 +870,99 @@ class TernaryFromIfElse(Transform):
             folds.append((tokens[index].start, fold_end, f"{lvalue} = {condition} ? {then_value} : {else_value};"))
             index = after_else  # skip the folded region, so folds stay disjoint
         return folds
+
+    @staticmethod
+    def _parse_assign(tokens: List[CToken], start: int, end: int) -> Optional[Tuple[int, int, int, int]]:
+        """
+        If `tokens[start:end]` is one assignment `LV = RHS` (with an optional `;`), return the token spans
+        `(lv_start, lv_end, rhs_start, rhs_end)`, else None.
+        """
+        if end > start and tokens[end - 1].text == ";":
+            end -= 1
+        depth, assign_index = 0, None
+        for index in range(start, end):
+            text = tokens[index].text
+            if text in "([{":
+                depth += 1
+            elif text in ")]}":
+                depth -= 1
+            elif depth == 0 and text == ";":
+                return None  # more than one statement
+            elif depth == 0 and text == "=":
+                if assign_index is not None:
+                    return None  # chained assignment
+                assign_index = index
+        if assign_index is None or assign_index == start or assign_index + 1 >= end:
+            return None
+        return start, assign_index, assign_index + 1, end
+
+    @classmethod
+    def _branch(
+        cls, tokens: List[CToken], start: int
+    ) -> Optional[Tuple[Optional[Tuple[int, int, int, int]], int, int]]:
+        """
+        Parse the then or else branch, braced or not, that starts at token `start`.
+
+        Return `(spans, after, end)`: `spans` from `_parse_assign`, or None if the branch is not exactly one
+        assignment; `after` is the index of the token after the branch and `end` the offset where it ends. Return None
+        if there is no complete branch.
+        """
+        token_count = len(tokens)
+        if start >= token_count:
+            return None
+        if tokens[start].text == "{":
+            close = match_delimiter(tokens, start)
+            if close is None:
+                return None
+            return cls._parse_assign(tokens, start + 1, close), close + 1, tokens[close].end
+        depth, index = 0, start
+        while index < token_count:
+            text = tokens[index].text
+            if text in "([{":
+                depth += 1
+            elif text in ")]}":
+                depth -= 1
+            elif depth == 0 and text == ";":
+                return cls._parse_assign(tokens, start, index), index + 1, tokens[index].end
+            index += 1
+        return None
+
+    @classmethod
+    def _has_update(cls, tokens: List[CToken], start: int, end: int) -> bool:
+        """True if `tokens[start:end]` holds `++`, `--` or an assignment, at any depth."""
+        return any(token.text in ("++", "--") or token.text in _ASSIGN_OPS for token in tokens[start:end])
+
+    @staticmethod
+    def _has_call(tokens: List[CToken], start: int, end: int) -> bool:
+        """
+        True if `tokens[start:end]` holds a call, at any depth: `name(`, `tab[0](` or `(*fp)(`.
+
+        `sizeof(` and casts are not calls; a `(...)` group before `(` is a callee only if it starts with `*`, which a
+        type never does. `(fp)(x)` cannot be told from a cast and is not counted.
+        """
+        for index in range(start + 1, end):
+            if tokens[index].text != "(":
+                continue
+            before = tokens[index - 1].text
+            if before == "]" or (_IDENT_RX.match(before) and before not in _NONVALUE_KW):
+                return True
+            if before == ")":
+                opener = _open_paren(tokens, start, index - 1)
+                if opener is not None and tokens[opener + 1].text == "*":
+                    return True
+        return False
+
+    @classmethod
+    def _has_side_effect(cls, tokens: List[CToken], start: int, end: int) -> bool:
+        """True if `tokens[start:end]` holds `++`, `--`, an assignment or a call, at any depth."""
+        return cls._has_update(tokens, start, end) or cls._has_call(tokens, start, end)
+
+    @staticmethod
+    def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
+        """The identifiers in `tokens[start:end]`, keywords excluded."""
+        return {
+            token.text for token in tokens[start:end] if _IDENT_RX.match(token.text) and token.text not in _NONVALUE_KW
+        }
 
 
 class CanonicalizeControlFlow(Transform):
@@ -948,12 +1037,6 @@ class CanonicalizeControlFlow(Transform):
             )
             transformed_pieces.append(kept_labels + statement)
         return "".join(transformed_pieces)
-
-
-# An identifier, and the keywords that may stand before a unary `*` and are never an operand value. (Numbers are
-# matched with `CINT`.)
-_IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
-_NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
 class MinimizeIntegerLiterals(Transform):
