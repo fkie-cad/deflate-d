@@ -18,6 +18,7 @@ from .ctokens import (
     CINT,
     CNUMBER,
     IDENT,
+    NONVALUE_KW,
     apply_edits,
     ctokenize,
     iter_depth,
@@ -97,9 +98,6 @@ _WIDTH_CAST_TYPES = frozenset({"_BYTE", "_WORD", "_DWORD", "_QWORD", "_OWORD"})
 # parenthesised type): an opening paren, a prefix-unary operator, an identifier,
 # a number, or a string/char literal.
 _OPERAND_START_OPS = frozenset({"(", "*", "&", "-", "~", "!", "+", "++", "--"})
-# Keywords that may precede a cast's `(` (a cast can follow `return`, `case`, ...)
-# without the parentheses being a call/grouping applied to a value.
-_CAST_PREV_KW = frozenset({"return", "case", "sizeof", "if", "while", "for", "switch", "do", "else", "goto"})
 # Bit widths of the pseudo-width types, for the literal-narrowing guard in
 # :class:`StripWidthCasts`: stripping `(_DWORD)` off a literal that does not fit
 # the cast width (or any float literal) would truncate it and change the value.
@@ -256,7 +254,7 @@ class StripWidthCasts(Transform):
         if prev == "sizeof":
             return True
         return bool(
-            prev in {")", "]"} or CNUMBER.fullmatch(prev) or (IDENT.fullmatch(prev) and prev not in _CAST_PREV_KW)
+            prev in {")", "]"} or CNUMBER.fullmatch(prev) or (IDENT.fullmatch(prev) and prev not in NONVALUE_KW)
         )
 
 

@@ -605,26 +605,6 @@ class DropNullPointerCast(Transform):
     _TYPE_OP_BEFORE_PAREN = frozenset(
         {"sizeof", "_Alignof", "alignof", "__alignof__", "typeof", "__typeof__", "decltype"}
     )
-    # Keywords that, before a `(`, make it a *grouping* paren rather than a call:
-    # `return ((T *)0x0)` is a group, `f((T *)0x0)` is a call. Used to tell the two
-    # apart when the cast+null is wrapped in its own parens (see apply()).
-    _GROUPING_BEFORE = frozenset(
-        {
-            "return",
-            "sizeof",
-            "if",
-            "while",
-            "for",
-            "switch",
-            "case",
-            "do",
-            "else",
-            "goto",
-            "_Alignof",
-            "alignof",
-            "typeof",
-        }
-    )
     # Tokens that may follow the null literal without the int/pointer distinction mattering.
     _SAFE_AFTER = frozenset({")", ";", ",", "]", "}", ":", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "?"})
     # The null constant in either spelling. ``int-minform`` (T2) re-spells ``0x0``
@@ -681,8 +661,7 @@ class DropNullPointerCast(Transform):
             if before == "(" and after == ")" and match_delimiter(toks, i - 1) == null_idx + 1:
                 outer_before = toks[i - 2][0] if i >= 2 else None
                 is_call = outer_before is not None and (
-                    outer_before in {")", "]"}
-                    or (IDENT.fullmatch(outer_before) and outer_before not in self._GROUPING_BEFORE)
+                    outer_before in {")", "]"} or (IDENT.fullmatch(outer_before) and outer_before not in NONVALUE_KW)
                 )
                 if not is_call:
                     outer_after = toks[null_idx + 2][0] if null_idx + 2 < n else None
