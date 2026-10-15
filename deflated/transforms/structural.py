@@ -55,6 +55,21 @@ _IDENT_RX = re.compile(r"^[A-Za-z_]\w*$")
 _NONVALUE_KW = _CTRL_KW | _STMT_KW
 
 
+def _is_cast(group_texts: List[str]) -> bool:
+    """
+    True if the token texts `group_texts` inside a `(...)` can only be a type: names followed by `*`s, with a known type
+    word or at least one `*` (`(int)`, `(undefined4 *)`). `(x)` may be a variable and `(x * y)` is an expression, so
+    neither counts.
+    """
+    name_count = 0
+    while name_count < len(group_texts) and _IDENT_RX.match(group_texts[name_count]):
+        name_count += 1
+    stars = group_texts[name_count:]
+    if name_count == 0 or any(text != "*" for text in stars):
+        return False
+    return bool(stars) or any(text in _TYPE_WORDS for text in group_texts)
+
+
 def _split_leading_labels(statement: str) -> Tuple[str, str]:
     """
     Split `statement` into its leading `label:` prefixes and the rest: `"L1: L2: x = 1;"` -> `("L1: L2: ", "x = 1;")`.
@@ -212,9 +227,11 @@ class DropSingleStatementBraces(Transform):
     description = "Drop braces around a single-statement control block (if/else/for/while/do)."
 
     def apply(self, code: str) -> str:
-        """Return `code` with the braces of every strippable control block replaced by spaces."""
-        # One pass is enough: unwrapping an inner block never makes the outer one strippable, since the outer body then
-        # starts with a control keyword.
+        """
+        Return `code` with the braces of every strippable control block replaced by spaces. One pass is enough:
+        unwrapping an inner block never makes the outer one strippable, since the outer body then starts with a control
+        keyword.
+        """
         for open_offset, close_offset in sorted(self._strippable_pairs(code), reverse=True):
             # Replace each brace with a space so its neighbours cannot merge: `else{x` must not become `elsex`.
             code = code[:open_offset] + " " + code[open_offset + 1 : close_offset] + " " + code[close_offset + 1 :]
@@ -538,7 +555,7 @@ class CompoundAssignment(Transform):
                 depth -= 1
                 open_index, operand_position = open_brackets.pop() if open_brackets else (index, False)
                 group_texts = [inner.text for inner in remainder_tokens[open_index + 1 : index]]
-                expects_operator = not (token.text == ")" and operand_position and cls._is_cast(group_texts))
+                expects_operator = not (token.text == ")" and operand_position and _is_cast(group_texts))
             elif not expects_operator and token.text in cls._PREFIX_OPS:
                 pass  # a prefix operator; its operand follows
             elif depth == 0 and expects_operator and token.text in cls._PRECEDENCE:
@@ -550,28 +567,14 @@ class CompoundAssignment(Transform):
                 expects_operator = True
         return True
 
-    @staticmethod
-    def _is_cast(group_texts: List[str]) -> bool:
-        """
-        True if the token texts `group_texts` inside a `(...)` can only be a type: names followed by `*`s, with a known
-        type word or at least one `*` (`(int)`, `(undefined4 *)`). `(x)` may be a variable and `(x * y)` is an
-        expression, so neither counts.
-        """
-        name_count = 0
-        while name_count < len(group_texts) and _IDENT_RX.match(group_texts[name_count]):
-            name_count += 1
-        stars = group_texts[name_count:]
-        if name_count == 0 or any(text != "*" for text in stars):
-            return False
-        return bool(stars) or any(text in _TYPE_WORDS for text in group_texts)
-
 
 class RedundantCastElision(Transform):
     """
     Remove the outer one of two identical adjacent casts: `(T)(T)x` -> `(T)x`.
 
-    The type must contain a `*` or a known type word and must not start with `*`, so calls like `(x)(x)` and
-    `(*fp)(*fp)` are never touched. Other redundant casts (a cast to the operand's own type) need type information.
+    The group must be a type by `_is_cast` (names followed by `*`s, with a known type word or a `*`), so calls like
+    `(x)(x)`, `(*fp)(*fp)` and `f(a * b)(a * b)` are never touched. Other redundant casts (a cast to the operand's own
+    type) need type information.
     """
 
     id = "cast-elision"
@@ -581,17 +584,17 @@ class RedundantCastElision(Transform):
     def apply(self, code: str) -> str:
         """
         Return `code` with the outer cast of every identical cast pair removed.
+
+        One tokenization is enough: removing `(T)` from `(A)(T)(T)` makes `(A)` touch the second `(T)`, but if `A` is
+        `T` it was a duplicate already, so a chain `(T)(T)(T)x` loses all but the last cast in one pass.
         """
-        # One tokenization is enough: removing `(T)` from `(A)(T)(T)` makes `(A)` touch the second `(T)`, but if `A` is
-        # `T` it was a duplicate already, so a chain `(T)(T)(T)x` loses all but the last cast here.
         for start, end in reversed(self._dup_casts(ctokenize(code))):
             code = code[:start] + code[end:]
         return code
 
-    def _dup_casts(self, tokens: List[CToken]) -> List[Tuple[int, int]]:
-        """
-        Offsets of every redundant cast `(T)` directly followed by `(T)`, left to right and non-overlapping.
-        """
+    @staticmethod
+    def _dup_casts(tokens: List[CToken]) -> List[Tuple[int, int]]:
+        """Offsets of every redundant cast `(T)` directly followed by `(T)`, left to right and non-overlapping."""
         cuts: List[Tuple[int, int]] = []
         token_count = len(tokens)
         for index in range(token_count):
@@ -607,20 +610,10 @@ class RedundantCastElision(Transform):
                 continue
             first_type = [token.text for token in tokens[index + 1 : first_close]]
             second_type = [token.text for token in tokens[first_close + 2 : second_close]]
-            if first_type and first_type == second_type and self._type_like(first_type):
-                # The first `(T)` is the redundant one.
-                cuts.append((tokens[index].start, tokens[first_close].end))
+            if first_type and first_type == second_type and _is_cast(first_type):
+                # The first `(T)` is the redundant one; the whitespace up to the second `(T)` goes with it.
+                cuts.append((tokens[index].start, tokens[first_close + 1].start))
         return cuts
-
-    @classmethod
-    def _type_like(cls, type_texts: List[str]) -> bool:
-        """
-        True if the token texts `type_texts` inside a `(...)` group can only be a type.
-        """
-        # A type never starts with `*`; `(*fp)` is a dereferenced function pointer.
-        if type_texts[0] == "*" or "," in type_texts or "?" in type_texts:
-            return False
-        return "*" in type_texts or any(text in _TYPE_WORDS for text in type_texts)
 
 
 class InlineSingleUseTemps(Transform):
@@ -796,11 +789,10 @@ class TernaryFromIfElse(Transform):
 
     def apply(self, code: str) -> str:
         """
-        Return `code` with every foldable if/else written as a ternary.
+        Return `code` with every foldable if/else written as a ternary. One pass is enough: a folded branch holds a
+        top-level `?`, which `_TERNARY_UNSAFE` rejects, so a fold never enables an enclosing one.
         """
         # Collect every disjoint fold in one tokenization and apply them right to left, so earlier offsets stay valid.
-        # A folded branch holds a top-level `?`, which `_TERNARY_UNSAFE` rejects, so a fold never enables an enclosing
-        # one and one pass is enough.
         for start, end, replacement in reversed(self._folds(code)):
             code = code[:start] + replacement + code[end:]
         return code
