@@ -51,6 +51,20 @@ CINT = re.compile(r"(?P<digits>0[xX][0-9a-fA-F]+|\d+)(?P<suffix>[uUlL]*|[uU]?i(?
 # An identifier or keyword: `fullmatch` tests a token, `finditer` finds the names in code.
 IDENT = re.compile(r"[A-Za-z_]\w*")
 
+# Keywords that start a control statement.
+CTRL_KW = frozenset({"if", "for", "while", "do", "switch", "else"})
+
+# Statement keywords that are not types, so `<kw> ...;` is never read as a declaration. The C++ ones matter too:
+# `delete p;` has the `type name;` shape.
+STMT_KW = frozenset(
+    {"return", "goto", "break", "continue", "case", "default", "sizeof", "typedef"}
+    | {"delete", "throw", "new", "co_return", "co_yield", "co_await", "using", "namespace"}
+)
+
+# Keywords that are never an operand value, so a `*`, `&` or `(` after one is unary or a group, not an operator or a
+# call.
+NONVALUE_KW = CTRL_KW | STMT_KW
+
 # A single C token: multi-char operators first (so they are not split), then identifiers, numeric literals, and finally
 # any single non-space character.
 CTOKEN = re.compile(

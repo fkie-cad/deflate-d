@@ -15,7 +15,7 @@ import string
 from typing import Callable
 
 from .base import Tier, Transform
-from .ctokens import CINT, CNUMBER, IDENT, apply_edits, ctokenize, match_delimiter
+from .ctokens import CINT, CNUMBER, IDENT, NONVALUE_KW, apply_edits, ctokenize, match_delimiter
 from .lexer import SegmentType, iter_code_matches, map_code, scan
 
 # Keywords/types we must never hand out as a generated short name.
@@ -749,7 +749,7 @@ class AddressOfIndexToOffset(Transform):
                 is_value = prev is not None and (
                     prev in self._VALUE_BEFORE
                     or CNUMBER.fullmatch(prev)
-                    or (IDENT.fullmatch(prev) and prev not in _RESERVED)
+                    or (IDENT.fullmatch(prev) and prev not in NONVALUE_KW)
                 )
                 unary = not is_value
                 after = toks[close + 1][0] if close is not None and close + 1 < n else None
@@ -786,7 +786,7 @@ class StripPointerSlotAddress(Transform):
     description = "Drop the .got.plt slot address from a recovered import pointer name."
 
     # PTR_ + a symbol (must contain a non-hex-only identifier) + _ + >=6 hex tail.
-    _RX = re.compile(r"^(PTR_[A-Za-z_]\w*?)_([0-9a-fA-F]{6,})$")
+    _RX = re.compile(r"^(?P<stripped>PTR_[A-Za-z_]\w*?)_[0-9a-fA-F]{6,}$")
 
     def apply(self, code: str) -> str:
         segments = scan(code)
@@ -796,7 +796,7 @@ class StripPointerSlotAddress(Transform):
         for name in names:
             m = self._RX.match(name)
             if m:
-                by_stripped.setdefault(m.group(1), []).append(name)
+                by_stripped.setdefault(m.group("stripped"), []).append(name)
         mapping = {
             origs[0]: stripped for stripped, origs in by_stripped.items() if len(origs) == 1 and stripped not in names
         }

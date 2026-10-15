@@ -20,8 +20,11 @@ from .ctokens import (
     CINT,
     CLOSER_FOR,
     CNUMBER,
+    CTRL_KW,
     IDENT,
+    NONVALUE_KW,
     OPENER_FOR,
+    STMT_KW,
     CToken,
     apply_edits,
     ctokenize,
@@ -35,16 +38,6 @@ from .ctokens import (
 )
 from .lexer import SegmentType, iter_code_matches, map_code, scan, strip_comments
 
-# Keywords that start a control statement, so a block body starting with one is not a single simple statement.
-_CTRL_KW = frozenset({"if", "for", "while", "do", "switch", "else"})
-
-# Statement keywords that are not types, so `<kw> ...;` is never read as a declaration. The C++ ones matter too:
-# `delete p;` has the `type name;` shape.
-_STMT_KW = frozenset(
-    {"return", "goto", "break", "continue", "case", "default", "sizeof", "typedef"}
-    | {"delete", "throw", "new", "co_return", "co_yield", "co_await", "using", "namespace"}
-)
-
 # The assignment operators: a side effect wherever they appear.
 _ASSIGN_OPS = frozenset({"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="})
 
@@ -56,10 +49,7 @@ _TYPE_WORDS = frozenset(
 )
 
 # One leading goto label such as `LABEL_3:` (not C++ `::`); group 1 is its name.
-_LABEL_PREFIX = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*")
-
-# The keywords that may stand before a unary `*` and are never an operand value.
-_NONVALUE_KW = _CTRL_KW | _STMT_KW
+_LABEL_PREFIX = re.compile(r"\s*(?P<label>[A-Za-z_]\w*)\s*:(?!:)\s*")
 
 
 def _is_cast(group_texts: List[str]) -> bool:
@@ -84,7 +74,9 @@ def _split_leading_labels(statement: str) -> Tuple[str, str]:
     `case` and `default` labels stay attached, so a `switch` body is never split.
     """
     prefix_length = 0
-    while (label_match := _LABEL_PREFIX.match(statement, prefix_length)) is not None and label_match.group(1) not in (
+    while (label_match := _LABEL_PREFIX.match(statement, prefix_length)) is not None and label_match.group(
+        "label"
+    ) not in (
         "case",
         "default",
     ):
@@ -155,7 +147,7 @@ class CoalesceDeclarations(Transform):
     )
 
     # First words that start a statement, not a type.
-    _NON_TYPES = _STMT_KW | _CTRL_KW
+    _NON_TYPES = NONVALUE_KW
 
     def _match_decl(self, piece: str) -> Optional[re.Match]:
         """Return the match if `piece` is a mergeable declaration whose first word is not a keyword, else None."""
@@ -282,10 +274,10 @@ class DropSingleStatementBraces(Transform):
             and texts[first + 2] != ":"  # not C++ `::`
         ):
             first += 2
-        if texts[first] in _CTRL_KW:
+        if texts[first] in CTRL_KW:
             return False
         # `if (c) int x;` is not valid C.
-        return texts[first] in _STMT_KW or not cls._looks_like_declaration(texts[first:])
+        return texts[first] in STMT_KW or not cls._looks_like_declaration(texts[first:])
 
     @classmethod
     def _looks_like_declaration(cls, texts: List[str]) -> bool:
@@ -612,7 +604,7 @@ class InlineSingleUseTemps(Transform):
     _RETURN = re.compile(r"^\s*return\s+(?P<name>[A-Za-z_]\w*)\s*;(?P<trail>\s*)$", re.S)
     _DECL = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_ ]*\s+\**(?P<name>[A-Za-z_]\w*)\s*;\s*$")
     # A function header `<return type> <name>(`; the return type is group 1.
-    _HEADER = re.compile(r"^\s*(.*?)\b[A-Za-z_]\w*\s*\(", re.S)
+    _HEADER = re.compile(r"^\s*(?P<ret_type>.*?)\b[A-Za-z_]\w*\s*\(", re.S)
     # Header words that are not part of the return type.
     _HEADER_NOISE = frozenset({"static", "inline", "extern", "__cdecl", "__stdcall", "__fastcall", "__thiscall"})
     # Declaration words that are not part of the temp's type, so they stay out of the cast.
@@ -673,7 +665,7 @@ class InlineSingleUseTemps(Transform):
             if decl_match is None:
                 continue
             words = piece.split()
-            if words[0] not in (_STMT_KW | _CTRL_KW) and "volatile" not in words and "extern" not in words:
+            if words[0] not in NONVALUE_KW and "volatile" not in words and "extern" not in words:
                 decl_indices_by_name[decl_match.group("name")].append(index)
         return decl_indices_by_name
 
@@ -760,7 +752,9 @@ class InlineSingleUseTemps(Transform):
         if header_match is None:
             return None
         words = [
-            word for word in re.split(r"(\W)", header_match.group(1)) if word.strip() and word not in cls._HEADER_NOISE
+            word
+            for word in re.split(r"(\W)", header_match.group("ret_type"))
+            if word.strip() and word not in cls._HEADER_NOISE
         ]
         return " ".join(words) or None
 
@@ -946,7 +940,7 @@ class TernaryFromIfElse(Transform):
             if tokens[index].text != "(":
                 continue
             before = tokens[index - 1].text
-            if before == "]" or (IDENT.fullmatch(before) and before not in _NONVALUE_KW):
+            if before == "]" or (IDENT.fullmatch(before) and before not in NONVALUE_KW):
                 return True
             if before == ")":
                 opener = match_delimiter_backward(tokens, index - 1, start)
@@ -963,7 +957,7 @@ class TernaryFromIfElse(Transform):
     def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
         """The identifiers in `tokens[start:end]`, keywords excluded."""
         return {
-            token.text for token in tokens[start:end] if IDENT.fullmatch(token.text) and token.text not in _NONVALUE_KW
+            token.text for token in tokens[start:end] if IDENT.fullmatch(token.text) and token.text not in NONVALUE_KW
         }
 
 
@@ -981,9 +975,9 @@ class CanonicalizeControlFlow(Transform):
     tier = Tier.T2_STRUCTURAL
     description = "Remove no-op gotos and unreferenced labels."
 
-    _GOTO = re.compile(r"^\s*goto\s+([A-Za-z_]\w*)\s*;\s*$")
+    _GOTO = re.compile(r"^\s*goto\s+(?P<label>[A-Za-z_]\w*)\s*;\s*$")
     # One label in a prefix from `_split_leading_labels`, with the whitespace after it.
-    _LABEL_NAME = re.compile(r"([A-Za-z_]\w*)\s*:\s*")
+    _LABEL_NAME = re.compile(r"(?P<label>[A-Za-z_]\w*)\s*:\s*")
 
     def apply(self, code: str) -> str:
         """
@@ -1005,7 +999,7 @@ class CanonicalizeControlFlow(Transform):
             labels, statement = _split_leading_labels(piece)
             names = set(self._LABEL_NAME.findall(labels))
             goto_match = self._GOTO.match(statement)
-            if goto_match and goto_match.group(1) in next_labels:
+            if goto_match and goto_match.group("label") in next_labels:
                 # Drop the goto. Its own labels now stand in front of the next statement.
                 kept_pieces.append(labels)
                 next_labels |= names
@@ -1030,7 +1024,7 @@ class CanonicalizeControlFlow(Transform):
             # Check every leading label, not only the first: in `B: A: x;` both may be unused.
             labels, statement = _split_leading_labels(piece)
             kept_labels = self._LABEL_NAME.sub(
-                lambda label_match: label_match.group(0) if label_match.group(1) in referenced else "", labels
+                lambda label_match: label_match.group(0) if label_match.group("label") in referenced else "", labels
             )
             transformed_pieces.append(kept_labels + statement)
         return "".join(transformed_pieces)
@@ -1115,7 +1109,7 @@ class DerefOffsetToIndex(Transform):
                 is_value = previous is not None and (
                     previous in self._VALUE_BEFORE
                     or CNUMBER.fullmatch(previous)
-                    or (IDENT.fullmatch(previous) and previous not in _NONVALUE_KW)
+                    or (IDENT.fullmatch(previous) and previous not in NONVALUE_KW)
                 )
                 if not is_value:
                     close = match_delimiter(tokens, index + 1)
@@ -1137,7 +1131,7 @@ class DerefOffsetToIndex(Transform):
         if (
             len(inner) == 3
             and IDENT.fullmatch(inner[0])
-            and inner[0] not in _NONVALUE_KW
+            and inner[0] not in NONVALUE_KW
             and inner[1] == "+"
             and CINT.fullmatch(inner[2])
         ):
@@ -1146,7 +1140,7 @@ class DerefOffsetToIndex(Transform):
             len(inner) == 4
             and inner[0] == "&"
             and IDENT.fullmatch(inner[1])
-            and inner[1] not in _NONVALUE_KW
+            and inner[1] not in NONVALUE_KW
             and inner[2] == "+"
             and CINT.fullmatch(inner[3])
         ):

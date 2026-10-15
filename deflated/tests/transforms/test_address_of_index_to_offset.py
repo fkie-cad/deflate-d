@@ -57,3 +57,10 @@ class TestAddressOfIndexToOffset:
     def test_inside_string_not_touched(self) -> None:
         src = 's = "&buf[0x10]";'
         assert AddressOfIndexToOffset().apply(src) == src
+
+    @pytest.mark.parametrize("name", ["id", "in", "no", "ok", "to"])
+    def test_bitwise_and_after_short_variable_kept(self, name) -> None:
+        # A variable named like a short English word is still a value, so the `&` after it is a bitwise and. Rewriting
+        # `id & mask[2]` would turn it into the call `id(mask+2)`.
+        src = f"int lookup(int {name}, int *mask)\n{{\n  return {name} & mask[2];\n}}\n"
+        assert AddressOfIndexToOffset().apply(src) == src
