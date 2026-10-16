@@ -14,6 +14,7 @@ nesting depth, `top_level_indices` / `first_top_level` / `split_top_level` find 
 (`split_args` and `has_top_level_token` are the common cases), and `split_statements` cuts code at top-level `;{}`.
 `word_before` works on raw characters instead and reads back the identifier ending at a given position.
 `apply_edits` writes a batch of `(start, end, replacement)` edits, found on the original offsets, back in one pass.
+`token_texts` reads a token span back as its texts.
 `is_value_before` tells whether a token ends an operand, from the shared keyword sets (`NONVALUE_KW`, `TYPE_OPERATORS`).
 
 A stray closer means the structure is unknown from there on. Every helper then answers so that its caller backs off:
@@ -170,6 +171,11 @@ OPENER_FOR = {closer: opener for opener, closer in CLOSER_FOR.items()}
 def _text(token: CToken | str) -> str:
     """The text of `token`, which is either a `CToken` or already a plain token string."""
     return token if isinstance(token, str) else token.text
+
+
+def token_texts(ctokens: Sequence[CToken], lo_idx: int, hi_idx: int) -> List[str]:
+    """The texts of the tokens `ctokens[lo_idx:hi_idx]`."""
+    return [token.text for token in ctokens[lo_idx:hi_idx]]
 
 
 def match_delimiter(ctokens: Sequence[CToken | str], open_idx: int) -> int | None:

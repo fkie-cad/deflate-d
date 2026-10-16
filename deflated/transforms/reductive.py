@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import List
 
 from .base import Tier, Transform
 from .contextual import _RESERVED
@@ -184,8 +185,7 @@ class StripWidthCasts(Transform):
             code = code[:lo] + code[hi:]
         return code
 
-    @classmethod
-    def _literal_safe(cls, cast_type: str, toks, j: int, n: int) -> bool:
+    def _literal_safe(self, cast_type: str, toks, j: int, n: int) -> bool:
         """Whether dropping ``(<cast_type>)`` is permitted for the operand beginning
         at token index ``j`` (or ``j >= n`` when the cast ends the input).
 
@@ -212,7 +212,7 @@ class StripWidthCasts(Transform):
         if tok == "(":
             close = match_delimiter(toks, j)
             if close == j + 2:
-                return cls._literal_safe(cast_type, toks, j + 1, n)
+                return self._literal_safe(cast_type, toks, j + 1, n)
             return True
         # A leading unary sign/complement. ``+LIT`` keeps the value; ``-LIT``/``~LIT``
         # of an integer literal become a large positive under the unsigned width
@@ -221,7 +221,7 @@ class StripWidthCasts(Transform):
         # expression, which this guard does not police.
         if tok in ("+", "-", "~"):
             if j + 1 < n and CNUMBER.fullmatch(toks[j + 1][0]):
-                return cls._literal_safe(cast_type, toks, j + 1, n) if tok == "+" else False
+                return self._literal_safe(cast_type, toks, j + 1, n) if tok == "+" else False
             return True
         if not CNUMBER.fullmatch(tok):
             return True  # not a literal: existing (lossy) behaviour
@@ -785,8 +785,8 @@ class ElideThunkBodies(Transform):
         spans = split_top_level(toks, 0, len(toks), {","})
         return None if spans is None else [toks[lo:hi] for lo, hi in spans]
 
-    @classmethod
-    def _strip_leading_casts(cls, c: list[str]) -> list[str]:
+    @staticmethod
+    def _strip_leading_casts(c: List[str]) -> List[str]:
         """Drop leading ``( type-spelling )`` casts (identifiers and ``*`` only)."""
         while len(c) > 1 and c[0] == "(":
             close = match_delimiter(c, 0)

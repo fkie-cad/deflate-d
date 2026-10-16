@@ -14,6 +14,12 @@ class TestTernaryFromIfElse:
             ("if (c) { x = 1; } else { x = 2; }", "x = c ? 1 : 2;"),
             ("if (a < b) x = a; else x = b;", "x = a < b ? a : b;"),
             ("if (c) { x = f(); } else { x = g(); }", "x = c ? f() : g();"),
+            ("if (c) x = 1; else { x = 2; }", "x = c ? 1 : 2;"),  # mixed bare and braced branches
+            ("if (c) { x = 1; } else x = 2;", "x = c ? 1 : 2;"),
+            ("if (c) a[i] = 1; else a[ i ] = 2;", "a[i] = c ? 1 : 2;"),  # lvalues compare token by token
+            # Only the inner if/else is one assignment per branch; the dangling else stays with the inner if.
+            ("if (a) x = 1; else if (b) x = 2; else x = 3;", "if (a) x = 1; else x = b ? 2 : 3;"),
+            ("if (c) if (d) x = 1; else x = 2;", "if (c) x = d ? 1 : 2;"),
         ],
     )
     def test_folded(self, src, expected) -> None:
@@ -25,9 +31,6 @@ class TestTernaryFromIfElse:
             "if (c) x = 1; else y = 2;",  # different lvalues
             "if (c) { x = 1; y = 2; } else { x = 3; }",  # multi-statement branch
             "if (c) x = 1;",  # no else
-            "if (c) x = a ? 1 : 2; else x = 3;",  # nested ternary in branch RHS
-            # A bare `=` in the condition is an unconditional side effect: folding
-            # would make `x = y` conditional, so the fold must be refused.
             "if (x = y) { z = a; } else { z = b; }",
             "if (p = next()) { r = 1; } else { r = 0; }",
             "if (c) x = a ? 1 : 2; else x = 3;",  # nested ternary in then-arm RHS
@@ -35,6 +38,9 @@ class TestTernaryFromIfElse:
             "if (a, b) x = 1; else x = 2;",  # top-level comma in condition
             "if (a = b) x = 1; else x = 2;",  # assignment in condition binds looser than ?:
             "if (a += b) x = 1; else x = 2;",  # compound assignment in condition
+            "if (c) x += 1; else x += 2;",  # compound assignment as the branch statement
+            "if (c) { /* keep */ x = 1; } else { x = 2; }",  # folding would drop the comment
+            "if (c) {\n#ifdef A\n  x = 1;\n#endif\n} else { x = 2; }",
         ],
     )
     def test_kept(self, src) -> None:
@@ -44,13 +50,15 @@ class TestTernaryFromIfElse:
         # `==` is a distinct token from `=`, so an equality test remains foldable.
         assert TernaryFromIfElse().apply("if (x == y) z = a; else z = b;") == "z = x == y ? a : b;"
 
-    def test_bare_assignment_in_condition_not_folded(self) -> None:
-        # A bare `=` in the condition is a side effect that must run
-        # unconditionally; folding it into `z = (x = y) ? a : b` would make the
-        # assignment conditional, so the fold is refused (`=` is in
-        # `_TERNARY_UNSAFE`). Contrast `test_equality_in_condition_still_folds`,
-        # where the distinct `==` token folds.
-        src = "if (x = y) z = a; else z = b;"
+    @pytest.mark.parametrize(
+        "src",
+        [
+            "if (c) x = 1; else x = y += 1;",  # `c ? 1 : y += 1` parses as `(c ? 1 : y) += 1`
+            "if (c) x = 1; else x = y <<= 1;",
+            "if (c) x = y += 1; else x = 2;",
+        ],
+    )
+    def test_no_fold_with_compound_assignment_in_branch(self, src) -> None:
         assert TernaryFromIfElse().apply(src) == src
 
     def test_multiple_folds_in_one_apply(self) -> None:

@@ -13,7 +13,7 @@ import re
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from itertools import accumulate, groupby
-from typing import DefaultDict, List, Optional, Set, Tuple
+from typing import DefaultDict, List, NamedTuple, Optional, Set, Tuple
 
 from .base import Tier, Transform
 from .ctokens import (
@@ -34,6 +34,7 @@ from .ctokens import (
     match_delimiter,
     match_delimiter_backward,
     split_statements,
+    token_texts,
     top_level_indices,
 )
 from .lexer import SegmentType, iter_code_matches, map_code, scan, strip_comments
@@ -256,8 +257,7 @@ class DropSingleStatementBraces(Transform):
             return tokens[paren_index - 1].text in {"if", "for", "while"}
         return before in {"else", "do"}
 
-    @classmethod
-    def _single_simple(cls, body: List[CToken]) -> bool:
+    def _single_simple(self, body: List[CToken]) -> bool:
         """True if the tokens `body` are one statement that is neither a control statement nor a declaration."""
         texts = [token.text for token in body]
         # Braces mean a nested block or a brace expression (`(T){1}`); skip rather than reason about them.
@@ -277,10 +277,9 @@ class DropSingleStatementBraces(Transform):
         if texts[first] in CTRL_KW:
             return False
         # `if (c) int x;` is not valid C.
-        return texts[first] in STMT_KW or not cls._looks_like_declaration(texts[first:])
+        return texts[first] in STMT_KW or not self._looks_like_declaration(texts[first:])
 
-    @classmethod
-    def _looks_like_declaration(cls, texts: List[str]) -> bool:
+    def _looks_like_declaration(self, texts: List[str]) -> bool:
         """
         True if the statement `texts` may be a declaration: a type, any `*` or `&`, then a name (`int x, y;`) or a
         pointer in parentheses (`int (*fp)(int);`). The type may have `ns::` parts, `<...>` arguments, or one `(...)`
@@ -295,7 +294,7 @@ class DropSingleStatementBraces(Transform):
             if texts[index : index + 2] == [":", ":"] and IDENT.fullmatch(texts[index + 2]):
                 index += 3
             elif texts[index] == "<" or (index == 1 and texts[index] == "(" and texts[index + 1] != "*"):
-                index = cls._skip_group(texts, index)
+                index = self._skip_group(texts, index)
             else:
                 break
         if index is None:
@@ -424,7 +423,7 @@ class CompoundAssignment(Transform):
         labels = statement[: tokens[0].start]
 
         assign_index = self._assign_index(tokens)
-        lhs_texts = [token.text for token in tokens[:assign_index]] if assign_index > 0 else []
+        lhs_texts = token_texts(tokens, 0, assign_index) if assign_index > 0 else []
         rhs_tokens = tokens[assign_index + 1 :]
         op_index = len(lhs_texts)  # the right side repeats the target, then OP
         if not (
@@ -499,8 +498,7 @@ class CompoundAssignment(Transform):
                 return False  # a name followed by `(` is a call
         return lhs_texts[0] in ("*", "(") or bool(re.fullmatch(r"[A-Za-z_]\w*", lhs_texts[0]))
 
-    @classmethod
-    def _remainder_safe(cls, operator: str, remainder_tokens: List[CToken]) -> bool:
+    def _remainder_safe(self, operator: str, remainder_tokens: List[CToken]) -> bool:
         """
         True if `a OP= rem` means the same as `a = a OP rem`, where OP is `operator` and rem is `remainder_tokens`.
 
@@ -522,11 +520,11 @@ class CompoundAssignment(Transform):
                 open_index, operand_position = open_brackets.pop()
                 group_texts = [inner.text for inner in remainder_tokens[open_index + 1 : index]]
                 expects_operator = not (text == ")" and operand_position and _is_cast(group_texts))
-            elif not expects_operator and text in cls._PREFIX_OPS:
+            elif not expects_operator and text in self._PREFIX_OPS:
                 pass  # a prefix operator; its operand follows
-            elif depth == 0 and expects_operator and text in cls._PRECEDENCE:
-                binds_tighter = cls._PRECEDENCE[text] < cls._PRECEDENCE[operator]
-                if not (binds_tighter or (text == operator and operator in cls._ASSOCIATIVE_OPS)):
+            elif depth == 0 and expects_operator and text in self._PRECEDENCE:
+                binds_tighter = self._PRECEDENCE[text] < self._PRECEDENCE[operator]
+                if not (binds_tighter or (text == operator and operator in self._ASSOCIATIVE_OPS)):
                     return False
                 expects_operator = False
             else:
@@ -574,8 +572,8 @@ class RedundantCastElision(Transform):
             second_close = match_delimiter(tokens, first_close + 1)
             if second_close is None:
                 continue
-            first_type = [token.text for token in tokens[index + 1 : first_close]]
-            second_type = [token.text for token in tokens[first_close + 2 : second_close]]
+            first_type = token_texts(tokens, index + 1, first_close)
+            second_type = token_texts(tokens, first_close + 2, second_close)
             if first_type and first_type == second_type and _is_cast(first_type):
                 # The first `(T)` is the redundant one; the whitespace up to the second `(T)` goes with it.
                 cuts.append((tokens[index].start, tokens[first_close + 1].start))
@@ -616,7 +614,7 @@ class InlineSingleUseTemps(Transform):
         pieces = split_statements(code)
         # Offsets into `code`, taken before any piece is rewritten.
         piece_starts = list(accumulate((len(piece) for piece in pieces), initial=0))[:-1]
-        scopes = self._scopes(code, piece_starts)
+        enclosing_blocks = self._enclosing_blocks(code, piece_starts)
         decl_indices_by_name = self._declarations(pieces)
         removed_pieces: Set[int] = set()  # indices of the declarations and returns a fold makes redundant
 
@@ -628,9 +626,11 @@ class InlineSingleUseTemps(Transform):
                 index += 1
                 continue
             name, expr = assign_match.group("name"), assign_match.group("expr")
-            # A declaration in another scope (a global) does not count, so its name occurs once too often.
+            # A declaration in another block (a global) does not count, so its name occurs once too often.
             decl_indices = [
-                decl_index for decl_index in decl_indices_by_name.get(name, []) if scopes[decl_index] == scopes[index]
+                decl_index
+                for decl_index in decl_indices_by_name.get(name, [])
+                if enclosing_blocks[decl_index] == enclosing_blocks[index]
             ]
             if len(decl_indices) > 1 or not self._is_single_use(name, expr, name_counts[name] - len(decl_indices)):
                 index += 1
@@ -650,8 +650,7 @@ class InlineSingleUseTemps(Transform):
         """Count each identifier in the code segments of `code`, so names in strings and comments are not counted."""
         return Counter(m.group(0) for m in iter_code_matches(scan(code), IDENT))
 
-    @classmethod
-    def _declarations(cls, pieces: List[str]) -> DefaultDict[str, List[int]]:
+    def _declarations(self, pieces: List[str]) -> DefaultDict[str, List[int]]:
         """
         Return the indices of the single-name, uninitialized declarations in `pieces`, by declared name.
 
@@ -661,7 +660,7 @@ class InlineSingleUseTemps(Transform):
         """
         decl_indices_by_name: DefaultDict[str, List[int]] = defaultdict(list)
         for index, piece in enumerate(pieces):
-            decl_match = cls._DECL.match(piece)
+            decl_match = self._DECL.match(piece)
             if decl_match is None:
                 continue
             words = piece.split()
@@ -685,51 +684,49 @@ class InlineSingleUseTemps(Transform):
             and not has_top_level_token(expr_tokens, 0, len(expr_tokens), frozenset({","}))
         )
 
-    @classmethod
-    def _temp_type(cls, declaration: str) -> str:
+    def _temp_type(self, declaration: str) -> str:
         """Return the type in `declaration`, without storage-class words: `static char *p;` -> `char *`."""
-        type_text = declaration[: cls._DECL.match(declaration).start("name")]
-        return " ".join(word for word in type_text.split() if word not in cls._STORAGE_CLASS)
+        type_text = declaration[: self._DECL.match(declaration).start("name")]
+        return " ".join(word for word in type_text.split() if word not in self._STORAGE_CLASS)
 
-    @classmethod
-    def _converted(cls, value: str, temp_type: str, return_type: Optional[str]) -> str:
+    def _converted(self, value: str, temp_type: str, return_type: Optional[str]) -> str:
         """
         Return `value` as the temp holds it. The store into the temp converts to its type: keep that as a cast unless
         the function returns the same type anyway.
         """
-        if return_type is not None and cls._squash(return_type) == cls._squash(temp_type):
+        if return_type is not None and self._squash(return_type) == self._squash(temp_type):
             return value
-        return f"({temp_type}){cls._as_operand(value)}"
+        return f"({temp_type}){self._as_operand(value)}"
 
     @staticmethod
-    def _scopes(code: str, offsets: List[int]) -> List[Optional[int]]:
+    def _enclosing_blocks(code: str, offsets: List[int]) -> List[Optional[int]]:
         """
-        For each of the ascending `offsets`, return the index of the top-level `{...}` block (the function body)
-        that contains it, or None if it is at file scope. After a stray `}` the scope is unknown, so each offset there
-        gets a negative value of its own that equals no other scope.
+        For each of the ascending `offsets`, return the id of the outermost `{...}` block (usually a function body)
+        that contains it, or None if it is at file scope. Blocks nested inside a body share the body's id, so two
+        ids are equal exactly when the offsets sit in the same body. After a stray `}` the enclosing block is
+        unknown, so each offset there gets a negative id of its own that equals no other.
         """
         tokens = ctokenize(code)
-        # The top-level block still open after each token, or None at file scope.
-        open_after: List[Optional[int]] = []
-        block = -1
+        # The id of the outermost block still open after each token, or None at file scope.
+        block_after_token: List[Optional[int]] = []
+        outer_block_id = -1
         for _, text, depth in iter_depth(tokens, openers="{"):
             if depth < 0:
-                break  # a stray `}`: the scope of everything from here on is unknown
+                break  # a stray `}`: the enclosing block of everything from here on is unknown
             if text == "{" and depth == 0:
-                block += 1
-            open_after.append(block if text == "{" or depth > 0 else None)
+                outer_block_id += 1
+            block_after_token.append(outer_block_id if text == "{" or depth > 0 else None)
         token_starts = [token.start for token in tokens]
-        scopes: List[Optional[int]] = []
+        blocks: List[Optional[int]] = []
         for position, offset in enumerate(offsets):
             before = bisect_left(token_starts, offset)  # the number of tokens that start before `offset`
-            if before > len(open_after):
-                scopes.append(-1 - position)  # past a stray `}`: a scope of its own, equal to no other
+            if before > len(block_after_token):
+                blocks.append(-1 - position)  # past a stray `}`: an id of its own, equal to no other
             else:
-                scopes.append(open_after[before - 1] if before else None)
-        return scopes
+                blocks.append(block_after_token[before - 1] if before else None)
+        return blocks
 
-    @classmethod
-    def _return_type(cls, code: str, offset: int) -> Optional[str]:
+    def _return_type(self, code: str, offset: int) -> Optional[str]:
         """Return the declared return type of the function whose body contains `offset`, or None if not found."""
         # `header` is the text before the top-level `{` that is still open, so it is the enclosing function's at any
         # depth; a top-level `}` or `;` ends the previous item, and the next header starts after it.
@@ -748,13 +745,13 @@ class InlineSingleUseTemps(Transform):
         if header is None:
             return None
         header = "\n".join(line for line in strip_comments(header).splitlines() if not line.lstrip().startswith("#"))
-        header_match = cls._HEADER.match(header)
+        header_match = self._HEADER.match(header)
         if header_match is None:
             return None
         words = [
             word
             for word in re.split(r"(\W)", header_match.group("ret_type"))
-            if word.strip() and word not in cls._HEADER_NOISE
+            if word.strip() and word not in self._HEADER_NOISE
         ]
         return " ".join(words) or None
 
@@ -779,6 +776,26 @@ class InlineSingleUseTemps(Transform):
         return f"({expr})"
 
 
+class _Branch(NamedTuple):
+    """Token spans `(start, end)` of a then or else branch `LV = VALUE;`, plus where the branch ends."""
+
+    lvalue: Tuple[int, int]
+    value: Tuple[int, int]
+    after: int  # index of the token after the branch
+    end_offset: int  # character offset where the branch ends
+
+
+class _IfElse(NamedTuple):
+    """Token spans `(start, end)` of a matched `if (C) LV = A; else LV = B;`, plus where the else branch ends."""
+
+    cond: Tuple[int, int]
+    lvalue: Tuple[int, int]
+    then_value: Tuple[int, int]
+    else_value: Tuple[int, int]
+    after: int  # index of the token after the else branch
+    end_offset: int  # character offset where the else branch ends
+
+
 class TernaryFromIfElse(Transform):
     """
     Fold `if (C) LV = A; else LV = B;` into `LV = C ? A : B;`, with braced or bare branches.
@@ -789,23 +806,16 @@ class TernaryFromIfElse(Transform):
     * `C` has a side effect (`++`, `--`, assignment, call), unless `LV` is a name that `C` does not use;
     * `LV` has a call;
     * `LV` has `++`, `--` or an assignment, and `C` shares a name with it or reads memory through `*`, `->` or `[`;
-    * `C`, `A` or `B` has a top-level `?` or `,`, or `C` a top-level assignment, which would regroup once inlined
-      (`if (a = b) ...` must not become `x = a = b ? 1 : 2`).
-
-    Known gap (CODE_REVIEW 1.5): `?:` converts `A` and `B` to a common type before the store, so branches of different
-    types (`-1` and `1u`) can change the stored value. Without type information this is not detected.
+    * `C`, `A` or `B` has a top-level `?`, `,` or assignment, which would regroup once inlined (`if (a = b) ...` must
+      not become `x = a = b ? 1 : 2`, nor `else x = y += 1` become `x = c ? 1 : y += 1`).
     """
 
     id = "ternary"
     tier = Tier.T2_STRUCTURAL
     description = "Fold a same-target if/else assignment into a ternary."
 
-    # Top-level tokens that block the fold in the condition or a branch: `?` and `,` would regroup once inlined, and so
-    # would a bare `=` in the condition (`if (a = b) ...`), which binds looser than `?:`. `==` is its own token and
-    # folds.
-    _TERNARY_UNSAFE = frozenset({"?", ",", "="})
-    # The condition may not hold a top-level compound assignment either, for the same reason.
-    _COND_UNSAFE = _TERNARY_UNSAFE | _ASSIGN_OPS
+    # Top-level `?`, `,` or assignment in the condition or a branch would regroup once inlined; `==` still folds.
+    _TERNARY_UNSAFE = frozenset({"?", ","}) | _ASSIGN_OPS
     # Tokens through which a condition may read memory that an update in the lvalue changes.
     _INDIRECT = frozenset({"*", "->", "["})
 
@@ -817,70 +827,81 @@ class TernaryFromIfElse(Transform):
         return apply_edits(code, self._folds(code))
 
     def _folds(self, code: str) -> List[Tuple[int, int, str]]:
-        """
-        Return all non-overlapping if/else -> ternary rewrites, left to right.
-        """
+        """Return all non-overlapping if/else -> ternary rewrites, left to right."""
         tokens = ctokenize(code)
-        token_count = len(tokens)
-        folds: List[Tuple[int, int, str]] = []
+        ternary_edits: List[Tuple[int, int, str]] = []
         index = 0
-        while index < token_count:
-            if tokens[index].text != "if" or index + 1 >= token_count or tokens[index + 1].text != "(":
+        while index < len(tokens):
+            match = self._match_if_else(tokens, index)
+            if match is None or not self._is_safe(tokens, match):
                 index += 1
                 continue
-            cond_start = index + 2
-            cond_end = match_delimiter(tokens, index + 1)  # the `)` after the condition
-            if cond_end is None or cond_end <= cond_start:  # need a non-empty condition
-                index += 1
-                continue
-            then_branch = self._branch(tokens, cond_end + 1)
-            if not then_branch or then_branch[0] is None:
-                index += 1
-                continue
-            then_spans, after_then, _ = then_branch
-            if after_then >= token_count or tokens[after_then].text != "else":
-                index += 1
-                continue
-            else_branch = self._branch(tokens, after_then + 1)
-            if not else_branch or else_branch[0] is None:
-                index += 1
-                continue
-            else_spans, after_else, fold_end = else_branch
+            ternary_edits.append((tokens[index].start, match.end_offset, self._ternary(code, tokens, match)))
+            index = match.after  # skip the folded region, so folds stay disjoint
+        return ternary_edits
 
-            lv_start, lv_end, then_start, then_end = then_spans
-            else_lv_start, else_lv_end, else_start, else_end = else_spans
-            if [token.text for token in tokens[lv_start:lv_end]] != [
-                token.text for token in tokens[else_lv_start:else_lv_end]
-            ]:
-                index += 1
-                continue
-            if (
-                has_top_level_token(tokens, cond_start, cond_end, self._COND_UNSAFE)
-                or has_top_level_token(tokens, then_start, then_end, self._TERNARY_UNSAFE)
-                or has_top_level_token(tokens, else_start, else_end, self._TERNARY_UNSAFE)
-            ):
-                index += 1
-                continue
-            # The if runs the condition before the lvalue; `LV = C ? A : B` does not fix their order. An update in
-            # the lvalue can only reach the condition through a shared name or memory read via `*`, `->`, `[`.
-            shared = self._identifiers(tokens, cond_start, cond_end) & self._identifiers(tokens, lv_start, lv_end)
-            lv_is_name = lv_end - lv_start == 1 and IDENT.fullmatch(tokens[lv_start].text)
-            cond_reads_memory = any(token.text in self._INDIRECT for token in tokens[cond_start:cond_end])
-            if (
-                (self._has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
-                or self._has_call(tokens, lv_start, lv_end)
-                or (self._has_update(tokens, lv_start, lv_end) and (shared or cond_reads_memory))
-            ):
-                index += 1
-                continue
+    def _match_if_else(self, tokens: List[CToken], index: int) -> Optional[_IfElse]:
+        """
+        If `tokens[index:]` starts with `if (C) LV = A; else LV = B;` (braced or bare branches, the same `LV`), return
+        its spans, else None.
+        """
+        if tokens[index].text != "if" or index + 1 >= len(tokens) or tokens[index + 1].text != "(":
+            return None
+        cond_start = index + 2
+        cond_end = match_delimiter(tokens, index + 1)  # the `)` after the condition
+        if cond_end is None or cond_end <= cond_start:  # need a non-empty condition
+            return None
+        then_branch = self._branch(tokens, cond_end + 1)
+        if then_branch is None:
+            return None
+        if then_branch.after >= len(tokens) or tokens[then_branch.after].text != "else":
+            return None
+        else_branch = self._branch(tokens, then_branch.after + 1)
+        if else_branch is None:
+            return None
+        if token_texts(tokens, *then_branch.lvalue) != token_texts(tokens, *else_branch.lvalue):
+            return None
+        return _IfElse(
+            (cond_start, cond_end),
+            then_branch.lvalue,
+            then_branch.value,
+            else_branch.value,
+            else_branch.after,
+            else_branch.end_offset,
+        )
 
-            condition = code[tokens[cond_start].start : tokens[cond_end - 1].end].strip()
-            lvalue = code[tokens[lv_start].start : tokens[lv_end - 1].end].strip()
-            then_value = code[tokens[then_start].start : tokens[then_end - 1].end].strip()
-            else_value = code[tokens[else_start].start : tokens[else_end - 1].end].strip()
-            folds.append((tokens[index].start, fold_end, f"{lvalue} = {condition} ? {then_value} : {else_value};"))
-            index = after_else  # skip the folded region, so folds stay disjoint
-        return folds
+    def _is_safe(self, tokens: List[CToken], match: _IfElse) -> bool:
+        """True if `match` can be written as a ternary without regrouping or reordering anything."""
+        if any(
+            has_top_level_token(tokens, start, end, self._TERNARY_UNSAFE)
+            for start, end in (match.cond, match.then_value, match.else_value)
+        ):
+            return False
+        cond_start, cond_end = match.cond
+        lv_start, lv_end = match.lvalue
+        # The if runs the condition before the lvalue; `LV = C ? A : B` does not fix their order. An update in the
+        # lvalue can only reach the condition through a shared name or memory read via `*`, `->`, `[`.
+        shared = self._identifiers(tokens, cond_start, cond_end) & self._identifiers(tokens, lv_start, lv_end)
+        lv_is_name = lv_end - lv_start == 1 and IDENT.fullmatch(tokens[lv_start].text)
+        cond_reads_memory = any(token.text in self._INDIRECT for token in tokens[cond_start:cond_end])
+        return not (
+            (self._has_side_effect(tokens, cond_start, cond_end) and (shared or not lv_is_name))
+            or self._has_call(tokens, lv_start, lv_end)
+            or (self._has_update(tokens, lv_start, lv_end) and (shared or cond_reads_memory))
+        )
+
+    def _ternary(self, code: str, tokens: List[CToken], match: _IfElse) -> str:
+        """Return `LV = C ? A : B;` for `match`."""
+        lvalue, condition, then_value, else_value = (
+            self._text(code, tokens, span) for span in (match.lvalue, match.cond, match.then_value, match.else_value)
+        )
+        return f"{lvalue} = {condition} ? {then_value} : {else_value};"
+
+    @staticmethod
+    def _text(code: str, tokens: List[CToken], span: Tuple[int, int]) -> str:
+        """The source text of the tokens `tokens[span[0]:span[1]]`."""
+        start, end = span
+        return code[tokens[start].start : tokens[end - 1].end].strip()
 
     @staticmethod
     def _parse_assign(tokens: List[CToken], start: int, end: int) -> Optional[Tuple[int, int, int, int]]:
@@ -899,32 +920,30 @@ class TernaryFromIfElse(Transform):
             return None
         return start, assign_index, assign_index + 1, end
 
-    @classmethod
-    def _branch(
-        cls, tokens: List[CToken], start: int
-    ) -> Optional[Tuple[Optional[Tuple[int, int, int, int]], int, int]]:
+    def _branch(self, tokens: List[CToken], start: int) -> Optional[_Branch]:
         """
-        Parse the then or else branch, braced or not, that starts at token `start`.
-
-        Return `(spans, after, end)`: `spans` from `_parse_assign`, or None if the branch is not exactly one
-        assignment; `after` is the index of the token after the branch and `end` the offset where it ends. Return None
-        if there is no complete branch.
+        Parse the then or else branch, braced or not, that starts at token `start`. Return None unless it is one
+        complete assignment.
         """
-        token_count = len(tokens)
-        if start >= token_count:
+        if start >= len(tokens):
             return None
         if tokens[start].text == "{":
-            close = match_delimiter(tokens, start)
-            if close is None:
+            last = match_delimiter(tokens, start)
+            if last is None:
                 return None
-            return cls._parse_assign(tokens, start + 1, close), close + 1, tokens[close].end
-        index = first_top_level(tokens, start, None, {";"})
-        if index is None:
+            spans = self._parse_assign(tokens, start + 1, last)
+        else:
+            last = first_top_level(tokens, start, None, {";"})
+            if last is None:
+                return None
+            spans = self._parse_assign(tokens, start, last)
+        if spans is None:
             return None
-        return cls._parse_assign(tokens, start, index), index + 1, tokens[index].end
+        lv_start, lv_end, value_start, value_end = spans
+        return _Branch((lv_start, lv_end), (value_start, value_end), last + 1, tokens[last].end)
 
-    @classmethod
-    def _has_update(cls, tokens: List[CToken], start: int, end: int) -> bool:
+    @staticmethod
+    def _has_update(tokens: List[CToken], start: int, end: int) -> bool:
         """True if `tokens[start:end]` holds `++`, `--` or an assignment, at any depth."""
         return any(token.text in ("++", "--") or token.text in _ASSIGN_OPS for token in tokens[start:end])
 
@@ -948,10 +967,9 @@ class TernaryFromIfElse(Transform):
                     return True
         return False
 
-    @classmethod
-    def _has_side_effect(cls, tokens: List[CToken], start: int, end: int) -> bool:
+    def _has_side_effect(self, tokens: List[CToken], start: int, end: int) -> bool:
         """True if `tokens[start:end]` holds `++`, `--`, an assignment or a call, at any depth."""
-        return cls._has_update(tokens, start, end) or cls._has_call(tokens, start, end)
+        return self._has_update(tokens, start, end) or self._has_call(tokens, start, end)
 
     @staticmethod
     def _identifiers(tokens: List[CToken], start: int, end: int) -> Set[str]:
@@ -1106,7 +1124,7 @@ class DerefOffsetToIndex(Transform):
                 if not is_value_before(previous):
                     close = match_delimiter(tokens, index + 1)
                     if close is not None:
-                        replacement = self._index_form([token.text for token in tokens[index + 2 : close]])
+                        replacement = self._index_form(token_texts(tokens, index + 2, close))
                         after = tokens[close + 1].text if close + 1 < token_count else None
                         if replacement is not None and after not in self._BLOCK_AFTER:
                             edits.append((tokens[index].start, tokens[close].end, replacement))

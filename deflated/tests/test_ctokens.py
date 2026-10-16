@@ -15,6 +15,7 @@ from deflated.transforms.ctokens import (
     split_args,
     split_statements,
     split_top_level,
+    token_texts,
     top_level_indices,
     word_before,
 )
@@ -403,3 +404,10 @@ def test_word_before(code: str, end_idx: int, expected: str) -> None:
 )
 def test_apply_edits(edits: list[tuple[int, int, str]], expected: str) -> None:
     assert apply_edits("abcdef", edits) == expected
+
+
+def test_token_texts() -> None:
+    tokens = ctokenize('a->b[i] = "x;y";')
+    assert token_texts(tokens, 0, 7) == ["a", "->", "b", "[", "i", "]", "="]
+    assert token_texts(tokens, 7, 9) == ['"x;y"', ";"]
+    assert token_texts(tokens, 3, 3) == []
